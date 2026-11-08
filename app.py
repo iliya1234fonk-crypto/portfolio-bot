@@ -74,6 +74,9 @@ DEFAULT_SETTINGS = {
         "ai": {"title": "ИИ-бот по документам", "price": "2 000 ₽", "term": "3–5 дней", "desc": "Отвечает клиентам по вашему прайсу и документам. Без вашего участия, 24/7."},
     },
     "about": "Делаю сайты и телеграм-ботов под конкретную задачу: приём заявок, запись клиентов, меню по QR, ответы на вопросы, автоматизация мелочей.\n\nДля бизнеса, учёбы и личных проектов — от простой визитки до бота, который работает вместо администратора.\n\nЦена и срок известны заранее. Демо показываю до оплаты. Если задача не моя — скажу прямо.",
+    "slot": "Принимаю заказы",
+    "faq": "Срок: обычно 1–4 дня.\nКак работаем: обсуждаем задачу → я показываю демо → вы решаете по оплате → передаю доступ и исходники.\nПравки: мелкие правки по задаче делаю.\nЧто нужно от вас: описание, примеры/тексты (если есть), куда слать заявки.",
+    "stats": {"starts": 0, "messages": 0, "leads": 0},
 }
 
 
@@ -84,13 +87,14 @@ def load_settings():
         # merge defaults
         out = json.loads(json.dumps(DEFAULT_SETTINGS))
         if isinstance(data, dict):
-            if data.get("owner_username"): out["owner_username"] = data["owner_username"]
-            if data.get("about"): out["about"] = data["about"]
+            for k in ("owner_username","about","slot","faq"):
+                if data.get(k): out[k] = data[k]
             sv = data.get("services") or {}
             if isinstance(sv, dict):
                 for k, v in sv.items():
                     if k in out["services"] and isinstance(v, dict):
                         out["services"][k].update({kk: vv for kk, vv in v.items() if vv})
+            if isinstance(data.get("stats"), dict): out["stats"].update(data["stats"])
         return out
     except Exception:
         return json.loads(json.dumps(DEFAULT_SETTINGS))
@@ -105,6 +109,26 @@ def save_settings(cfg):
 
 
 SETTINGS = load_settings()
+_LAST_MSG = {}
+
+def rate_ok(chat_id):
+    now = time.time()
+    k = str(chat_id)
+    last = _LAST_MSG.get(k, 0)
+    if now - last < 0.7:
+        return False
+    _LAST_MSG[k] = now
+    return True
+
+def bump_stat(key):
+    try:
+        SETTINGS.setdefault("stats", {}).setdefault(key, 0)
+        SETTINGS["stats"][key] += 1
+        # save occasionally not every time? keep simple
+        if SETTINGS["stats"][key] % 5 == 1:
+            save_settings(SETTINGS)
+    except Exception:
+        pass
 
 
 def owner_username():
@@ -426,8 +450,8 @@ MENU = [
 REPLY_KB = {
     "keyboard": [
         [{"text": "Каталог"}, {"text": "Примеры"}],
-        [{"text": "Как работаю"}, {"text": "Связаться"}],
-        [{"text": "Свой вариант"}, {"text": "Меню"}],
+        [{"text": "Как работаю"}, {"text": "FAQ / статус"}],
+        [{"text": "Связаться"}, {"text": "Меню"}],
     ],
     "resize_keyboard": True,
 }
@@ -663,12 +687,16 @@ def broadcast():
 # ---------- настройки (админ) ----------
 def show_settings(chat_id):
     ou = owner_username()
+    st = SETTINGS.get("stats") or {}
     rows = [
         [{"text": "Цены услуг", "callback_data": "adm:prices"}],
         [{"text": "Контакт (@" + (ou or "-") + ")", "callback_data": "adm:owner"}],
+        [{"text": "Статус слотов", "callback_data": "adm:slot"}],
+        [{"text": "Статистика", "callback_data": "adm:stats"}],
         [{"text": "В меню", "callback_data": "menu"}],
     ]
-    send(chat_id, "<b>Настройки бота</b>\n\nБазовые настройки. Каждое изменение придёт всем администраторам с уведомлением.", keyboard=rows)
+    send(chat_id, "<b>Настройки бота</b>\n\nСтатус: %s\nЗапусков: %s · Сообщений: %s · Обращений: %s\n\nКаждое изменение придёт всем администраторам с уведомлением." % (
+        SETTINGS.get("slot","-"), st.get("starts",0), st.get("messages",0), st.get("leads",0)), keyboard=rows)
 
 
 def show_price_settings(chat_id):
@@ -683,6 +711,8 @@ def handle_message(msg):
     chat_id = msg["chat"]["id"]
     text = (msg.get("text") or "").strip()
     user = msg.get("from", {})
+    if not rate_ok(chat_id) and not is_admin(chat_id):
+        return
 
     try:
         with open("/tmp/chatids.log", "a") as f:
@@ -690,6 +720,31 @@ def handle_message(msg):
     except Exception:
         pass
     remember(chat_id, user)
+    bump_stat("messages")
+
+    # медиа/файлы от пользователя -> админу с кнопкой Ответить
+    if not text and not is_admin(chat_id):
+        kind = "файл/медиа"
+        if msg.get("photo"): kind = "фото"
+        elif msg.get("document"): kind = "документ"
+        elif msg.get("voice"): kind = "голосовое"
+        elif msg.get("video_note"): kind = "видеосообщение"
+        elif msg.get("video"): kind = "видео"
+        elif msg.get("audio"): kind = "аудио"
+        if any(msg.get(k) for k in ("photo","document","voice","video_note","video","audio","sticker")):
+            notify_admin(
+                "<b>СООБЩЕНИЕ В БОТЕ (%s)</b>\n\n%s (@%s)\n<code>%s</code>\n\n%s" % (
+                    kind, user.get("first_name","-"), user.get("username","-"), chat_id,
+                    (msg.get("caption") or "").strip() or "(без текста)"
+                ), reply_to=chat_id)
+            for aid in ADMIN_IDS:
+                try:
+                    api("copyMessage", chat_id=aid, from_chat_id=chat_id, message_id=msg["message_id"])
+                except Exception:
+                    pass
+            bump_stat("leads")
+            return send(chat_id, "Получил, передал. Отвечу здесь, в боте.", [[{"text":"В меню","callback_data":"menu"}]], reply_keyboard=REPLY_KB)
+
 
     # ответ админа пользователю (внутри бота)
     if is_admin(chat_id):
@@ -734,9 +789,21 @@ def handle_message(msg):
             who = user.get("username") or user.get("first_name") or str(chat_id)
             notify_change(who, "Контакт изменён", "Было: @%s\nСтало: @%s" % (old, owner_username()))
             return show_settings(chat_id)
+        if st.get("step") == "setslot" and text and not text.startswith("/"):
+            if text.lower() in ("отмена", "cancel"):
+                state.pop(chat_id, None)
+                return show_settings(chat_id)
+            old = SETTINGS.get("slot","-")
+            SETTINGS["slot"] = text
+            save_settings(SETTINGS)
+            state.pop(chat_id, None)
+            who = user.get("username") or user.get("first_name") or str(chat_id)
+            notify_change(who, "Статус изменён", "Было: %s\nСтало: %s" % (old, text))
+            return show_settings(chat_id)
 
     if text.startswith("/start"):
         state.pop(chat_id, None)
+        bump_stat("starts")
         payload = text[6:].strip()
         if payload.startswith("order_"):
             return show_service(chat_id, payload[6:])
@@ -781,6 +848,9 @@ def handle_message(msg):
         "как я работаю": "trust",
         "связаться": "contact",
         "свой вариант": "custom",
+        "faq / статус": "faq",
+        "faq": "faq",
+        "статус": "faq",
         "меню": "menu",
     }
     q = quick.get(text.lower())
@@ -801,6 +871,11 @@ def handle_message(msg):
             return send_photo_file(chat_id, TRUST_CAPTION, rows, "trust.jpg")
         if qk == "contact":
             return send_photo_file(chat_id, contact_text(), contact_kb(), "scr_contact.jpg")
+        if qk == "faq":
+            slot = SETTINGS.get("slot") or "Принимаю заказы"
+            faq = SETTINGS.get("faq") or ""
+            txt = "<b>Статус:</b> %s\n\n<b>FAQ</b>\n%s" % (slot, faq)
+            return send(chat_id, txt, [[{"text":"Написать в боте","callback_data":"ask"}],[{"text":"В меню","callback_data":"menu"}]], reply_keyboard=REPLY_KB)
         return None
 
     step = state.get(chat_id, {}).get("step")
@@ -913,8 +988,22 @@ def handle_callback(cb):
             return send(chat_id, "Недоступно.")
         to = data.split(":", 1)[1].strip()
         state[chat_id] = {"step": "reply", "to": to}
-        return send(chat_id, "Введите ответ для <code>%s</code>. Напишите «отмена», чтобы выйти." % to,
-                    [[{"text": "Отмена", "callback_data": "cancelreply"}]])
+        qr = [
+            [{"text":"Уточню детали","callback_data":"qr:%s:1"%to},{"text":"Могу взять","callback_data":"qr:%s:2"%to}],
+            [{"text":"Срок 1–2 дня","callback_data":"qr:%s:3"%to},{"text":"Пришлите пример","callback_data":"qr:%s:4"%to}],
+            [{"text":"Отмена","callback_data":"cancelreply"}],
+        ]
+        return send(chat_id, "Ответ для <code>%s</code>: выберите шаблон или напишите свой текст." % to, qr)
+    if data.startswith("qr:") and is_admin(chat_id):
+        parts = data.split(":")
+        if len(parts) >= 3:
+            to = parts[1]; n = parts[2]
+            templates = {"1":"Уточню пару деталей и отвечу.","2":"Могу взять эту задачу. Напишите, пожалуйста, подробности.","3":"По срокам ориентировочно 1–2 дня.","4":"Пришлите, пожалуйста, пример или подробнее опишите задачу."}
+            msg = templates.get(n, "Здравствуйте!")
+            send(to, "<b>Ответ от продавца</b>\n\n%s" % msg, keyboard=[[{"text":"Ответить в боте","callback_data":"ask"}]])
+            state.pop(chat_id, None)
+            notify_change(user.get("username") or user.get("first_name") or str(chat_id), "Быстрый ответ отправлен", "Кому: %s\nТекст: %s" % (to, msg))
+            return send(chat_id, "Шаблон отправлен пользователю <code>%s</code>." % to)
     if data == "cancelreply" and is_admin(chat_id):
         state.pop(chat_id, None)
         return send(chat_id, "Ответ отменён.", [[{"text": "В меню", "callback_data": "menu"}]])
@@ -930,6 +1019,13 @@ def handle_callback(cb):
         sv = svc(sid)
         state[chat_id] = {"step": "setprice:%s" % sid}
         return send(chat_id, "Услуга: <b>%s</b>\nТекущая цена: <b>%s</b>\n\nОтправьте новую цену (например: <code>900 ₽</code>) или «отмена»." % (sv["title"], sv["price"]))
+    if data == "adm:stats" and is_admin(chat_id):
+        st = SETTINGS.get("stats") or {}
+        return send(chat_id, "<b>Статистика</b>\n\nЗапусков: %s\nСообщений: %s\nОбращений: %s\nПользователей в базе: %s" % (
+            st.get("starts",0), st.get("messages",0), st.get("leads",0), len(USERS)), keyboard=[[{"text":"Назад","callback_data":"adm:back"}]])
+    if data == "adm:slot" and is_admin(chat_id):
+        state[chat_id] = {"step": "setslot"}
+        return send(chat_id, "Текущий статус: <b>%s</b>\n\nОтправьте новый статус (например: «Принимаю заказы» или «Занят до завтра») или «отмена»." % (SETTINGS.get("slot","-")))
     if data.startswith("svc:"):
         return show_service(chat_id, data[4:])
     if data.startswith("buy:"):
