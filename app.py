@@ -61,6 +61,114 @@ def remember(chat_id, user):
         save_users(USERS)
 
 
+# ---------- настройки бота (базовые, меняются админами) ----------
+SETTINGS_FILE = os.path.join(HERE, "settings.json")
+
+DEFAULT_SETTINGS = {
+    "owner_username": OWNER_USERNAME or "z0nchik",
+    "services": {
+        "zayavki": {"title": "Бот приёма заявок", "price": "750 ₽", "term": "1–2 дня", "desc": "Клиент пишет боту — заявка сразу падает вам в личку. Меню, кнопки, уведомления."},
+        "zapis": {"title": "Бот записи", "price": "1 250 ₽", "term": "2–3 дня", "desc": "Услуга → мастер → время. Напоминание за час. Клиенты записываются сами."},
+        "site": {"title": "Сайт-визитка", "price": "500 ₽", "term": "2–4 дня", "desc": "Услуги, цены, фото, форма заявки. Открывается с телефона, заявки приходят в телеграм."},
+        "menu": {"title": "Меню по QR", "price": "750 ₽", "term": "1–2 дня", "desc": "Для кафе и доставки: гость сканирует QR, видит меню и делает заказ без звонка."},
+        "ai": {"title": "ИИ-бот по документам", "price": "2 000 ₽", "term": "3–5 дней", "desc": "Отвечает клиентам по вашему прайсу и документам. Без вашего участия, 24/7."},
+    },
+    "about": "Делаю сайты и телеграм-ботов под конкретную задачу: приём заявок, запись клиентов, меню по QR, ответы на вопросы, автоматизация мелочей.\n\nДля бизнеса, учёбы и личных проектов — от простой визитки до бота, который работает вместо администратора.\n\nЦена и срок известны заранее. Демо показываю до оплаты. Если задача не моя — скажу прямо.",
+}
+
+
+def load_settings():
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        # merge defaults
+        out = json.loads(json.dumps(DEFAULT_SETTINGS))
+        if isinstance(data, dict):
+            if data.get("owner_username"): out["owner_username"] = data["owner_username"]
+            if data.get("about"): out["about"] = data["about"]
+            sv = data.get("services") or {}
+            if isinstance(sv, dict):
+                for k, v in sv.items():
+                    if k in out["services"] and isinstance(v, dict):
+                        out["services"][k].update({kk: vv for kk, vv in v.items() if vv})
+        return out
+    except Exception:
+        return json.loads(json.dumps(DEFAULT_SETTINGS))
+
+
+def save_settings(cfg):
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=1)
+    except Exception as e:
+        print("settings save error:", e)
+
+
+SETTINGS = load_settings()
+
+
+def owner_username():
+    return (SETTINGS.get("owner_username") or OWNER_USERNAME or "z0nchik").lstrip("@")
+
+
+def _make_change_photo(title, details):
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        FONT = "/tmp/Onest.ttf"
+        W, H = 1280, 720
+        def fnt(size, weight=700):
+            f = ImageFont.truetype(FONT, size)
+            try: f.set_variation_by_axes([weight])
+            except Exception: pass
+            return f
+        # bg
+        img = Image.new("RGB", (W, H), (11, 14, 19))
+        d = ImageDraw.Draw(img)
+        for y in range(H):
+            t = y/(H-1)
+            c = tuple(int(11 + (20-11)*t) if i<2 else int(19 + (34-19)*t) for i in range(3))
+            d.line([(0,y),(W,y)], fill=c)
+        for x in range(0,W,60): d.line([(x,0),(x,H)], fill=(24,30,38), width=1)
+        for y in range(0,H,60): d.line([(0,y),(W,y)], fill=(24,30,38), width=1)
+        acc = (182,255,62)
+        d.text((72,60), "ИЗМЕНЕНИЕ В БОТЕ", font=fnt(26,600), fill=acc)
+        d.rectangle([72,98,260,102], fill=acc)
+        # wrap title
+        d.text((68,170), title[:60], font=fnt(52,800), fill=(246,248,250))
+        y = 270
+        for line in (details or "").split("\n"):
+            line = line.strip()
+            if not line: y += 14; continue
+            # wrap
+            words, cur = line.split(), ""
+            for w in words:
+                test = (cur+" "+w).strip()
+                if d.textbbox((0,0), test, font=fnt(26,400))[2] < 1120: cur = test
+                else:
+                    d.text((72,y), cur, font=fnt(26,400), fill=(138,148,166)); y += 38; cur = w
+            if cur:
+                d.text((72,y), cur, font=fnt(26,400), fill=(138,148,166)); y += 38
+            if y > 620: break
+        d.rounded_rectangle([72, H-110, 520, H-54], radius=28, fill=(28,36,46), outline=acc, width=2)
+        d.text((104, H-96), "уведомление администраторов", font=fnt(22,600), fill=acc)
+        path = os.path.join(HERE, "change_notice.jpg")
+        img.save(path, quality=92)
+        return path
+    except Exception as e:
+        print("change photo error:", e)
+        return ""
+
+
+def notify_change(who_name, title, details):
+    caption = "<b>%s</b>\n\n%s\n\nИзменил: %s" % (title, details, who_name)
+    photo = _make_change_photo(title, details)
+    for aid in ADMIN_IDS:
+        if photo:
+            send_photo_file(aid, caption, None, os.path.basename(photo))
+        else:
+            send(aid, caption)
+
+
 def _asset(name):
     for p in (os.path.join(HERE, "assets", name), os.path.join(HERE, name)):
         if os.path.exists(p):
@@ -91,48 +199,14 @@ def plain(text):
 
 
 # ---------- каталог ----------
-SERVICES = [
-    {
-        "id": "zayavki",
-        "title": "Бот приёма заявок",
-        "price": "750 ₽",
-        "term": "1–2 дня",
-        "photo": "svc_zayavki.jpg",
-        "desc": "Клиент пишет боту — заявка сразу падает вам в личку. Меню, кнопки, уведомления.",
-    },
-    {
-        "id": "zapis",
-        "title": "Бот записи",
-        "price": "1 250 ₽",
-        "term": "2–3 дня",
-        "photo": "svc_zapis.jpg",
-        "desc": "Услуга → мастер → время. Напоминание за час. Клиенты записываются сами.",
-    },
-    {
-        "id": "site",
-        "title": "Сайт-визитка",
-        "price": "500 ₽",
-        "term": "2–4 дня",
-        "photo": "svc_site.jpg",
-        "desc": "Услуги, цены, фото, форма заявки. Открывается с телефона, заявки приходят в телеграм.",
-    },
-    {
-        "id": "menu",
-        "title": "Меню по QR",
-        "price": "750 ₽",
-        "term": "1–2 дня",
-        "photo": "svc_menu.jpg",
-        "desc": "Для кафе и доставки: гость сканирует QR, видит меню и делает заказ без звонка.",
-    },
-    {
-        "id": "ai",
-        "title": "ИИ-бот по документам",
-        "price": "2 000 ₽",
-        "term": "3–5 дней",
-        "photo": "svc_ai.jpg",
-        "desc": "Отвечает клиентам по вашему прайсу и документам. Без вашего участия, 24/7.",
-    },
-]
+_SERVICE_META = {
+    "zayavki": {"photo": "svc_zayavki.jpg"},
+    "zapis": {"photo": "svc_zapis.jpg"},
+    "site": {"photo": "svc_site.jpg"},
+    "menu": {"photo": "svc_menu.jpg"},
+    "ai": {"photo": "svc_ai.jpg"},
+}
+_SERVICE_ORDER = ["zayavki", "zapis", "site", "menu", "ai"]
 
 CUSTOM = {
     "id": "custom",
@@ -144,8 +218,22 @@ CUSTOM = {
 }
 
 
+def get_services():
+    sv = SETTINGS.get("services") or {}
+    out = []
+    for sid in _SERVICE_ORDER:
+        d = dict((DEFAULT_SETTINGS["services"].get(sid) or {}))
+        d.update(sv.get(sid) or {})
+        d["id"] = sid
+        d["photo"] = _SERVICE_META.get(sid, {}).get("photo", "svc_custom.jpg")
+        out.append(d)
+    return out
+
+SERVICES = get_services()
+
+
 def svc(sid):
-    for s in SERVICES:
+    for s in get_services():
         if s["id"] == sid:
             return s
     return CUSTOM
@@ -306,9 +394,10 @@ def deep_link(sid):
 
 
 def dm_link(text):
-    if not OWNER_USERNAME:
+    ou = owner_username()
+    if not ou:
         return ""
-    return "https://t.me/%s?text=%s" % (OWNER_USERNAME, quote(text))
+    return "https://t.me/%s?text=%s" % (ou, quote(text))
 
 
 # ---------- тексты ----------
@@ -426,7 +515,7 @@ ASK_DONE = (
 
 def catalog_text():
     lines = ["<b>Каталог услуг</b>\n"]
-    for s in SERVICES:
+    for s in get_services():
         lines.append("• <b>%s</b> — %s" % (s["title"], s["price"]))
     lines.append("• <b>Свой вариант</b> — по задаче")
     lines.append("\nЦены можно обсудить — есть кнопка «Предложить свою цену».")
@@ -436,7 +525,7 @@ def catalog_text():
 
 def catalog_kb():
     rows = []
-    for s in SERVICES:
+    for s in get_services():
         rows.append([{"text": "%s · %s" % (s["title"], s["price"]), "callback_data": "svc:" + s["id"]}])
     rows.append([{"text": "Свой вариант", "callback_data": "svc:custom"}])
     rows.append([{"text": "Предложить свою цену", "callback_data": "bargain"}])
@@ -470,7 +559,7 @@ def service_kb(s):
 
 
 def contact_text():
-    owner = ("@" + OWNER_USERNAME) if OWNER_USERNAME else "ответным сообщением"
+    ou = owner_username(); owner = ("@" + ou) if ou else "ответным сообщением"
     return "<b>Связаться</b>\n\nТелеграм: %s\n\nОтвечаю быстро — телефон под рукой." % owner
 
 
@@ -570,6 +659,25 @@ def broadcast():
     return ok, fail
 
 
+
+# ---------- настройки (админ) ----------
+def show_settings(chat_id):
+    ou = owner_username()
+    rows = [
+        [{"text": "Цены услуг", "callback_data": "adm:prices"}],
+        [{"text": "Контакт (@" + (ou or "-") + ")", "callback_data": "adm:owner"}],
+        [{"text": "В меню", "callback_data": "menu"}],
+    ]
+    send(chat_id, "<b>Настройки бота</b>\n\nБазовые настройки. Каждое изменение придёт всем администраторам с уведомлением.", keyboard=rows)
+
+
+def show_price_settings(chat_id):
+    rows = []
+    for sv in get_services():
+        rows.append([{"text": "%s — %s" % (sv["title"], sv["price"]), "callback_data": "adm:setp:%s" % sv["id"]}])
+    rows.append([{"text": "Назад", "callback_data": "adm:back"}])
+    send(chat_id, "<b>Цены услуг</b>\n\nНажмите на услугу, чтобы изменить цену.", keyboard=rows)
+
 # ---------- обработка ----------
 def handle_message(msg):
     chat_id = msg["chat"]["id"]
@@ -600,6 +708,32 @@ def handle_message(msg):
                 )
                 return send(chat_id, "Ответ отправлен пользователю <code>%s</code>." % to)
             return send(chat_id, "Не найден получатель.", [[{"text": "В меню", "callback_data": "menu"}]])
+        if st.get("step", "").startswith("setprice:") and text and not text.startswith("/"):
+            if text.lower() in ("отмена", "cancel"):
+                state.pop(chat_id, None)
+                return show_price_settings(chat_id)
+            sid = st["step"].split(":", 1)[1]
+            old = (SETTINGS.get("services", {}).get(sid) or {}).get("price") or (DEFAULT_SETTINGS["services"].get(sid) or {}).get("price") or "-"
+            SETTINGS.setdefault("services", {}).setdefault(sid, {})["price"] = text
+            save_settings(SETTINGS)
+            global SERVICES
+            SERVICES = get_services()
+            state.pop(chat_id, None)
+            who = user.get("username") or user.get("first_name") or str(chat_id)
+            sv = svc(sid)
+            notify_change(who, "Цена изменена", "Услуга: %s\nБыло: %s\nСтало: %s" % (sv["title"], old, text))
+            return show_price_settings(chat_id)
+        if st.get("step") == "setowner" and text and not text.startswith("/"):
+            if text.lower() in ("отмена", "cancel"):
+                state.pop(chat_id, None)
+                return show_settings(chat_id)
+            old = owner_username()
+            SETTINGS["owner_username"] = text.lstrip("@").strip()
+            save_settings(SETTINGS)
+            state.pop(chat_id, None)
+            who = user.get("username") or user.get("first_name") or str(chat_id)
+            notify_change(who, "Контакт изменён", "Было: @%s\nСтало: @%s" % (old, owner_username()))
+            return show_settings(chat_id)
 
     if text.startswith("/start"):
         state.pop(chat_id, None)
@@ -626,7 +760,7 @@ def handle_message(msg):
 
     if text == "/links" and is_admin(chat_id):
         rows = ["<b>Ссылки для постов</b>\n", "Кидай в ВК или куда угодно — человек попадёт сразу на услугу:\n"]
-        for s in SERVICES:
+        for s in get_services():
             rows.append("<b>%s</b>\n%s\n" % (s["title"], deep_link(s["id"])))
         rows.append("<b>Свой вариант</b>\n%s" % deep_link("custom"))
         return send(chat_id, "\n".join(rows))
@@ -634,6 +768,9 @@ def handle_message(msg):
     if text.startswith("/rassylka") and is_admin(chat_id):
         ok, fail = broadcast()
         return send(chat_id, "Разослано: %s. Не дошло: %s. Всего в базе: %s." % (ok, fail, len(USERS)))
+
+    if text == "/settings" and is_admin(chat_id):
+        return show_settings(chat_id)
 
     # быстрые кнопки снизу (reply keyboard)
     quick = {
@@ -781,6 +918,18 @@ def handle_callback(cb):
     if data == "cancelreply" and is_admin(chat_id):
         state.pop(chat_id, None)
         return send(chat_id, "Ответ отменён.", [[{"text": "В меню", "callback_data": "menu"}]])
+    if data == "adm:back" and is_admin(chat_id):
+        return show_settings(chat_id)
+    if data == "adm:prices" and is_admin(chat_id):
+        return show_price_settings(chat_id)
+    if data == "adm:owner" and is_admin(chat_id):
+        state[chat_id] = {"step": "setowner"}
+        return send(chat_id, "Текущий контакт: @%s\n\nОтправьте новый username (без @) или «отмена»." % owner_username())
+    if data.startswith("adm:setp:") and is_admin(chat_id):
+        sid = data.split(":", 2)[2]
+        sv = svc(sid)
+        state[chat_id] = {"step": "setprice:%s" % sid}
+        return send(chat_id, "Услуга: <b>%s</b>\nТекущая цена: <b>%s</b>\n\nОтправьте новую цену (например: <code>900 ₽</code>) или «отмена»." % (sv["title"], sv["price"]))
     if data.startswith("svc:"):
         return show_service(chat_id, data[4:])
     if data.startswith("buy:"):
