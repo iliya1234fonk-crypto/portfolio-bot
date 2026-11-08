@@ -222,6 +222,70 @@ def plain(text):
     return TG_EMOJI_RE.sub(r"\1", text)
 
 
+
+
+# ---------- данные (тикеты/отзывы/сегменты) ----------
+DATA_FILE = os.path.join(HERE, "data.json")
+
+def load_data():
+    try:
+        with open(DATA_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        if not isinstance(d, dict): d = {}
+    except Exception:
+        d = {}
+    d.setdefault("tickets", [])
+    d.setdefault("reviews", [])  # {id,user,name,text,status}
+    d.setdefault("segments", {}) # chat_id -> last segment
+    d.setdefault("notes", {})    # chat_id -> note
+    d.setdefault("seq", 0)
+    return d
+
+def save_data(d):
+    try:
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=1)
+    except Exception as e:
+        print("data save error:", e)
+
+DATA = load_data()
+
+def next_id():
+    DATA["seq"] = int(DATA.get("seq") or 0) + 1
+    save_data(DATA); return DATA["seq"]
+
+def set_segment(chat_id, seg):
+    DATA.setdefault("segments", {})[str(chat_id)] = seg
+    save_data(DATA)
+
+def add_ticket(chat_id, user, kind, text, service=""):
+    t = {"id": next_id(), "ts": int(time.time()), "chat_id": str(chat_id),
+         "name": user.get("first_name","-"), "username": user.get("username","-"),
+         "kind": kind, "service": service, "text": text, "status": "новый"}
+    DATA.setdefault("tickets", []).append(t)
+    DATA["tickets"] = DATA["tickets"][-200:]
+    save_data(DATA); return t
+
+def set_ticket_status(tid, status):
+    for t in DATA.get("tickets", []):
+        if str(t.get("id")) == str(tid):
+            t["status"] = status; save_data(DATA); return t
+    return None
+
+def find_ticket(tid):
+    for t in DATA.get("tickets", []):
+        if str(t.get("id")) == str(tid): return t
+    return None
+
+def approved_reviews():
+    return [r for r in DATA.get("reviews", []) if r.get("status") == "approved"][-10:]
+
+def log_error(ctx, e):
+    try:
+        notify_admin("<b>Ошибка бота</b>\n\n%s\n<code>%s</code>" % (ctx, str(e)[:500]))
+    except Exception:
+        pass
+
 # ---------- каталог ----------
 _SERVICE_META = {
     "zayavki": {"photo": "svc_zayavki.jpg"},
@@ -443,14 +507,14 @@ ABOUT = (
 MENU = [
     [{"text": "Каталог услуг", "callback_data": "catalog", "style": "primary"}],
     [{"text": "Примеры работ", "callback_data": "examples"}],
-    [{"text": "Как я работаю", "callback_data": "trust"}],
+    [{"text": "Отзывы / FAQ", "callback_data": "reviews"}],
     [{"text": "Связаться", "callback_data": "contact"}],
 ]
 
 REPLY_KB = {
     "keyboard": [
         [{"text": "Каталог"}, {"text": "Примеры"}],
-        [{"text": "Как работаю"}, {"text": "FAQ / статус"}],
+        [{"text": "Отзывы"}, {"text": "FAQ / статус"}],
         [{"text": "Связаться"}, {"text": "Меню"}],
     ],
     "resize_keyboard": True,
@@ -603,12 +667,14 @@ def show_menu(chat_id):
 
 
 def show_catalog(chat_id):
+    set_segment(chat_id, "catalog"); bump_stat("leads")
     send_photo_file(chat_id, catalog_text(), catalog_kb(), "scr_catalog.jpg")
 
 
 def show_service(chat_id, sid):
-    s = svc(sid)
-    send_photo_file(chat_id, service_caption(s), service_kb(s), s.get("photo",""))
+    set_segment(chat_id, sid)
+    item = svc(sid)
+    send_photo_file(chat_id, service_caption(item), service_kb(item), item.get("photo",""))
 
 
 def reply_kb(chat_id):
@@ -683,6 +749,20 @@ def broadcast():
     return ok, fail
 
 
+
+
+def show_reviews(chat_id):
+    rev = approved_reviews()
+    slot = SETTINGS.get("slot") or "Принимаю заказы"
+    faq = SETTINGS.get("faq") or ""
+    lines = ["<b>Статус:</b> %s" % slot, "", "<b>FAQ</b>", faq, "", "<b>Отзывы</b>"]
+    if rev:
+        for r in rev[-5:]:
+            lines.append("• <b>%s</b>: %s" % (r.get("name","-"), (r.get("text","")[:220])))
+    else:
+        lines.append("Пока нет опубликованных отзывов.")
+    kb = [[{"text":"Оставить отзыв","callback_data":"rev:add"}],[{"text":"Оформить заявку","callback_data":"brief:start"}],[{"text":"В меню","callback_data":"menu"}]]
+    send(chat_id, "\n".join(lines), kb, reply_keyboard=REPLY_KB)
 
 # ---------- настройки (админ) ----------
 def show_settings(chat_id):
@@ -833,8 +913,18 @@ def handle_message(msg):
         return send(chat_id, "\n".join(rows))
 
     if text.startswith("/rassylka") and is_admin(chat_id):
-        ok, fail = broadcast()
-        return send(chat_id, "Разослано: %s. Не дошло: %s. Всего в базе: %s." % (ok, fail, len(USERS)))
+        arg = text.split(None,1)[1].strip() if len(text.split(None,1))>1 else ""
+        ok = fail = 0
+        kb = broadcast_kb()
+        for cid in list(USERS.keys()):
+            if arg:
+                seg = (DATA.get("segments") or {}).get(str(cid),"")
+                if arg.lower() not in str(seg).lower(): continue
+            r = send_photo_file(cid, BROADCAST_TEXT, kb, "trust.jpg")
+            if r.get("ok"): ok+=1
+            else: fail+=1
+            time.sleep(1.0)
+        return send(chat_id, "Разослано: %s. Не дошло: %s. Фильтр: %s" % (ok, fail, arg or "всем"))
 
     if text == "/settings" and is_admin(chat_id):
         return show_settings(chat_id)
@@ -848,9 +938,10 @@ def handle_message(msg):
         "как я работаю": "trust",
         "связаться": "contact",
         "свой вариант": "custom",
-        "faq / статус": "faq",
-        "faq": "faq",
-        "статус": "faq",
+        "faq / статус": "reviews",
+        "faq": "reviews",
+        "статус": "faq_status",
+        "отзывы": "reviews",
         "меню": "menu",
     }
     q = quick.get(text.lower())
@@ -871,7 +962,9 @@ def handle_message(msg):
             return send_photo_file(chat_id, TRUST_CAPTION, rows, "trust.jpg")
         if qk == "contact":
             return send_photo_file(chat_id, contact_text(), contact_kb(), "scr_contact.jpg")
-        if qk == "faq":
+        if qk == "reviews":
+            return show_reviews(chat_id)
+        if qk == "faq_status":
             slot = SETTINGS.get("slot") or "Принимаю заказы"
             faq = SETTINGS.get("faq") or ""
             txt = "<b>Статус:</b> %s\n\n<b>FAQ</b>\n%s" % (slot, faq)
@@ -930,6 +1023,42 @@ def handle_message(msg):
         )
         return send(chat_id, ASK_DONE, [[{"text": "В меню", "callback_data": "menu"}]])
 
+    if step == "review":
+        if q:
+            state.pop(chat_id, None); r=_route(q); 
+            if r is not None: return r
+        state.pop(chat_id, None)
+        rid = next_id()
+        DATA.setdefault("reviews", []).append({"id": rid, "chat_id": str(chat_id), "name": user.get("first_name","-"), "username": user.get("username","-"), "text": text, "status":"pending"})
+        save_data(DATA)
+        notify_admin("<b>НОВЫЙ ОТЗЫВ (на модерации)</b>\n\n%s (@%s)\n<code>%s</code>\n\n%s" % (user.get("first_name","-"), user.get("username","-"), chat_id, text),
+                     reply_to=chat_id)
+        for aid in ADMIN_IDS:
+            send(aid, "Отзыв #%s: опубликовать?" % rid, keyboard=[[{"text":"Опубликовать","callback_data":"revok:%s"%rid},{"text":"Отклонить","callback_data":"revno:%s"%rid}]])
+        return send(chat_id, "Спасибо! Отзыв отправлен на проверку.", [[{"text":"В меню","callback_data":"menu"}]], reply_keyboard=REPLY_KB)
+
+    if step and str(step).startswith("brief:"):
+        if q and str(step) == "brief:1":
+            state.pop(chat_id, None); r=_route(q)
+            if r is not None: return r
+        st = state[chat_id] = dict(state.get(chat_id) or {})
+        if step == "brief:1":
+            st["brief_task"] = text; st["step"] = "brief:2"
+            return send(chat_id, "<b>Оформить заявку (2/3)</b>\n\nКакой срок и примерный бюджет?")
+        if step == "brief:2":
+            st["brief_time"] = text; st["step"] = "brief:3"
+            return send(chat_id, "<b>Оформить заявку (3/3)</b>\n\nКак с вами связаться и есть ли детали/пример? (можно контакты, ссылку, описание)")
+        if step == "brief:3":
+            b = dict(st); state.pop(chat_id, None)
+            summary = "Задача: %s\nСрок/бюджет: %s\nДетали: %s" % (b.get("brief_task","-"), b.get("brief_time","-"), text)
+            t = add_ticket(chat_id, user, "бриф", summary)
+            bump_stat("leads")
+            kb = [reply_kb(chat_id)[0],
+                  [{"text":"Принят","callback_data":"tstat:%s:принят"%t["id"]},{"text":"В работе","callback_data":"tstat:%s:в работе"%t["id"]},{"text":"Готово","callback_data":"tstat:%s:готово"%t["id"]}]]
+            for aid in ADMIN_IDS:
+                send(aid, "<b>ЗАЯВКА (бриф) #%s</b>\n\n%s (@%s)\n<code>%s</code>\n\n%s" % (t["id"], user.get("first_name","-"), user.get("username","-"), chat_id, summary), keyboard=kb)
+            return send(chat_id, "Заявка #%s отправлена. Я отвечу здесь, в боте." % t["id"], [[{"text":"Написать в боте","callback_data":"ask"}],[{"text":"В меню","callback_data":"menu"}]], reply_keyboard=REPLY_KB)
+
     r = _route(q)
     if r is not None:
         return r
@@ -954,12 +1083,14 @@ def handle_callback(cb):
     if data == "examples":
         return send_photo_file(chat_id, EXAMPLES_ASK, EXAMPLES_KB, "scr_examples.jpg")
     if data == "ex_bots":
+        set_segment(chat_id, "bots")
         return send_photo_file(
             chat_id, EXAMPLES_BOTS_CAPTION,
             [[{"text": "Примеры сайтов", "callback_data": "ex_sites"}], [{"text": "В меню", "callback_data": "menu"}]],
             "examples_bots.jpg",
         )
     if data == "ex_sites":
+        set_segment(chat_id, "sites")
         return send_photo_file(
             chat_id, EXAMPLES_SITES_CAPTION,
             [[{"text": "Примеры ботов", "callback_data": "ex_bots"}], [{"text": "В меню", "callback_data": "menu"}]],
@@ -1021,11 +1152,48 @@ def handle_callback(cb):
         return send(chat_id, "Услуга: <b>%s</b>\nТекущая цена: <b>%s</b>\n\nОтправьте новую цену (например: <code>900 ₽</code>) или «отмена»." % (sv["title"], sv["price"]))
     if data == "adm:stats" and is_admin(chat_id):
         st = SETTINGS.get("stats") or {}
-        return send(chat_id, "<b>Статистика</b>\n\nЗапусков: %s\nСообщений: %s\nОбращений: %s\nПользователей в базе: %s" % (
-            st.get("starts",0), st.get("messages",0), st.get("leads",0), len(USERS)), keyboard=[[{"text":"Назад","callback_data":"adm:back"}]])
+        segs = {}
+        for v in (DATA.get("segments") or {}).values(): segs[v]=segs.get(v,0)+1
+        segtxt = ", ".join("%s:%s"%(k,v) for k,v in segs.items()) or "-"
+        return send(chat_id, "<b>Статистика</b>\n\nЗапусков: %s\nСообщений: %s\nОбращений: %s\nПользователей: %s\nСегменты: %s\nЗаявок: %s\nОтзывов (ок/всего): %s/%s" % (
+            st.get("starts",0), st.get("messages",0), st.get("leads",0), len(USERS), segtxt, len(DATA.get("tickets",[])), len(approved_reviews()), len(DATA.get("reviews",[]))),
+            keyboard=[[{"text":"Экспорт настроек","callback_data":"adm:export"},{"text":"Назад","callback_data":"adm:back"}]])
+    if data == "adm:export" and is_admin(chat_id):
+        try:
+            return send(chat_id, "<b>settings.json</b>\n<pre>%s</pre>" % json.dumps(SETTINGS, ensure_ascii=False, indent=1)[:3800])
+        except Exception as e:
+            return send(chat_id, "Ошибка: %s" % e)
     if data == "adm:slot" and is_admin(chat_id):
         state[chat_id] = {"step": "setslot"}
         return send(chat_id, "Текущий статус: <b>%s</b>\n\nОтправьте новый статус (например: «Принимаю заказы» или «Занят до завтра») или «отмена»." % (SETTINGS.get("slot","-")))
+    if data == "reviews":
+        return show_reviews(chat_id)
+    if data == "rev:add":
+        state[chat_id] = {"step":"review"}
+        return send(chat_id, "<b>Оставить отзыв</b>\n\nНапишите ваш отзыв одним сообщением. После проверки он появится в разделе отзывов.")
+    if data.startswith("revok:") and is_admin(chat_id):
+        rid = data.split(":",1)[1]
+        for r in DATA.get("reviews",[]):
+            if str(r.get("id"))==str(rid): r["status"]="approved"; save_data(DATA); break
+        notify_change(user.get("username") or "admin", "Отзыв опубликован", "ID отзыва: %s" % rid)
+        return send(chat_id, "Отзыв %s опубликован." % rid)
+    if data.startswith("revno:") and is_admin(chat_id):
+        rid = data.split(":",1)[1]
+        for r in DATA.get("reviews",[]):
+            if str(r.get("id"))==str(rid): r["status"]="rejected"; save_data(DATA); break
+        return send(chat_id, "Отзыв %s отклонён." % rid)
+    if data == "brief:start":
+        state[chat_id] = {"step":"brief:1"}
+        set_segment(chat_id, "brief")
+        return send(chat_id, "<b>Оформить заявку (1/3)</b>\n\nЧто нужно сделать? (услуга или задача)")
+    if data.startswith("tstat:") and is_admin(chat_id):
+        _, tid, stt = data.split(":", 2)
+        t = set_ticket_status(tid, stt)
+        if t:
+            send(t["chat_id"], "<b>Статус заявки #%s:</b> %s" % (tid, stt), keyboard=[[{"text":"Написать в боте","callback_data":"ask"}]])
+            notify_change(user.get("username") or "admin", "Статус заявки", "Заявка #%s → %s" % (tid, stt))
+        return send(chat_id, "Статус заявки #%s: %s" % (tid, stt))
+
     if data.startswith("svc:"):
         return show_service(chat_id, data[4:])
     if data.startswith("buy:"):
@@ -1033,6 +1201,7 @@ def handle_callback(cb):
     return show_menu(chat_id)
 
 
+_last_err = [0]
 def handle_update(update):
     try:
         if "message" in update:
@@ -1041,6 +1210,12 @@ def handle_update(update):
             handle_callback(update["callback_query"])
     except Exception as e:
         print("Handler error:", e)
+        try:
+            if time.time() - _last_err[0] > 300:
+                _last_err[0] = time.time()
+                notify_admin("<b>Ошибка бота</b>\n\n<code>%s</code>" % str(e)[:800])
+        except Exception:
+            pass
 
 
 # ---------- сервер ----------
