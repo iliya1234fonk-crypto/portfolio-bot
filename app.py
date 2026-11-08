@@ -413,6 +413,16 @@ BARGAIN_DONE = (
     "Посмотрю задачу и бюджет, отвечу в личку."
 )
 
+ASK_PROMPT = (
+    "<b>Сообщение в боте</b>\n\n"
+    "Напишите ваш вопрос или детали одним сообщением — я получу его здесь и отвечу в этом чате."
+)
+
+ASK_DONE = (
+    "Сообщение отправлено.\n\n"
+    "Я отвечу здесь, в боте."
+)
+
 
 def catalog_text():
     lines = ["<b>Каталог услуг</b>\n"]
@@ -438,7 +448,7 @@ def service_caption(s):
     return (
         "<b>%s</b>\n\n%s\n\n"
         "<b>%s</b> · срок %s\n\n"
-        "Если подходит — жмите «Написать мне», откроется чат с уже готовым сообщением."
+        "Можно написать в личку или прямо здесь, в боте — я отвечу."
     ) % (s["title"], s["desc"], s["price"], s["term"])
 
 
@@ -453,7 +463,8 @@ def service_kb(s):
         )
     link = dm_link(draft)
     if link:
-        rows.append([{"text": "Написать мне", "url": link}])
+        rows.append([{"text": "Написать в личку", "url": link}])
+    rows.append([{"text": "Написать в боте", "callback_data": "ask"}])
     rows.append([{"text": "Назад к каталогу", "callback_data": "catalog"}])
     return rows
 
@@ -468,6 +479,7 @@ def contact_kb():
     link = dm_link("Здравствуйте! Пишу из бота. Хочу обсудить заказ.")
     if link:
         rows.append([{"text": "Написать в личку", "url": link}])
+    rows.append([{"text": "Написать в боте", "callback_data": "ask"}])
     rows.append([{"text": "В меню", "callback_data": "menu"}])
     return rows
 
@@ -486,26 +498,39 @@ def show_service(chat_id, sid):
     send_photo_file(chat_id, service_caption(s), service_kb(s), s.get("photo",""))
 
 
-def notify_admin(text):
+def reply_kb(chat_id):
+    return [[{"text": "Ответить", "callback_data": "reply:%s" % chat_id}]]
+
+
+def notify_admin(text, reply_to=None):
+    kb = reply_kb(reply_to) if reply_to else None
     for aid in ADMIN_IDS:
-        send(aid, text)
+        send(aid, text, keyboard=kb)
 
 
 def handle_buy(chat_id, user, sid):
-    s = svc(sid)
+    item = svc(sid)
+    notify_admin(
+        "<b>ЗАКАЗ / ИНТЕРЕС</b>\n\n"
+        "Услуга: <b>%s</b> (%s)\n"
+        "Клиент: %s (@%s)\n"
+        "<code>%s</code>"
+        % (item["title"], item["price"], user.get("first_name", "-"), user.get("username", "-"), chat_id),
+        reply_to=chat_id,
+    )
     rows = []
     link = dm_link(
         "Здравствуйте! Пишу из бота. Интересует «%s» — %s. Хочу уточнить детали."
-        % (s["title"], s["price"])
+        % (item["title"], item["price"])
     )
     if link:
-        rows.append([{"text": "Написать мне", "url": link}])
+        rows.append([{"text": "Написать в личку", "url": link}])
+    rows.append([{"text": "Написать в боте", "callback_data": "ask"}])
     rows.append([{"text": "В меню", "callback_data": "menu"}])
     send(
         chat_id,
-        "Нажмите «Написать мне» — откроется чат со мной, сообщение уже набрано.\n\n"
-        "Если не открывается, пишите сюда: %s"
-        % (("@" + OWNER_USERNAME) if OWNER_USERNAME else "ответом на это сообщение"),
+        "По услуге <b>%s</b> можно написать мне в личку или прямо здесь, в боте — я отвечу."
+        % item["title"],
         rows,
     )
 
@@ -527,7 +552,7 @@ def broadcast_kb():
     ]
     link = dm_link("Здравствуйте! Пишу из бота. Хочу обсудить задачу.")
     if link:
-        rows.append([{"text": "Написать мне", "url": link}])
+        rows.append([{"text": "Написать в личку", "url": link}])
     return rows
 
 
@@ -557,6 +582,24 @@ def handle_message(msg):
     except Exception:
         pass
     remember(chat_id, user)
+
+    # ответ админа пользователю (внутри бота)
+    if is_admin(chat_id):
+        st = state.get(chat_id, {})
+        if st.get("step") == "reply" and text and not text.startswith("/"):
+            if text.lower() in ("отмена", "cancel", "меню"):
+                state.pop(chat_id, None)
+                return send(chat_id, "Ответ отменён.", [[{"text": "В меню", "callback_data": "menu"}]])
+            to = st.get("to")
+            state.pop(chat_id, None)
+            if to:
+                send(
+                    to,
+                    "<b>Ответ от продавца</b>\n\n%s" % text,
+                    keyboard=[[{"text": "Ответить в боте", "callback_data": "ask"}]],
+                )
+                return send(chat_id, "Ответ отправлен пользователю <code>%s</code>." % to)
+            return send(chat_id, "Не найден получатель.", [[{"text": "В меню", "callback_data": "menu"}]])
 
     if text.startswith("/start"):
         state.pop(chat_id, None)
@@ -636,7 +679,8 @@ def handle_message(msg):
             "%s (@%s)\n"
             "<code>%s</code>\n\n"
             "%s"
-            % (user.get("first_name", "-"), user.get("username", "-"), chat_id, text)
+            % (user.get("first_name", "-"), user.get("username", "-"), chat_id, text),
+            reply_to=chat_id,
         )
         return send(chat_id, CUSTOM_DONE, [[{"text": "В меню", "callback_data": "menu"}]])
 
@@ -652,9 +696,27 @@ def handle_message(msg):
             "%s (@%s)\n"
             "<code>%s</code>\n\n"
             "%s"
-            % (user.get("first_name", "-"), user.get("username", "-"), chat_id, text)
+            % (user.get("first_name", "-"), user.get("username", "-"), chat_id, text),
+            reply_to=chat_id,
         )
         return send(chat_id, BARGAIN_DONE, [[{"text": "В меню", "callback_data": "menu"}]])
+
+    if step == "ask":
+        if q:
+            state.pop(chat_id, None)
+            r = _route(q)
+            if r is not None:
+                return r
+        state.pop(chat_id, None)
+        notify_admin(
+            "<b>СООБЩЕНИЕ В БОТЕ</b>\n\n"
+            "%s (@%s)\n"
+            "<code>%s</code>\n\n"
+            "%s"
+            % (user.get("first_name", "-"), user.get("username", "-"), chat_id, text),
+            reply_to=chat_id,
+        )
+        return send(chat_id, ASK_DONE, [[{"text": "В меню", "callback_data": "menu"}]])
 
     r = _route(q)
     if r is not None:
@@ -706,6 +768,19 @@ def handle_callback(cb):
     if data == "bargain":
         state[chat_id] = {"step": "bargain"}
         return send_photo_file(chat_id, BARGAIN_ASK, [[{"text": "В меню", "callback_data": "menu"}]], "scr_catalog.jpg")
+    if data == "ask":
+        state[chat_id] = {"step": "ask"}
+        return send(chat_id, ASK_PROMPT, [[{"text": "В меню", "callback_data": "menu"}]])
+    if data.startswith("reply:"):
+        if not is_admin(chat_id):
+            return send(chat_id, "Недоступно.")
+        to = data.split(":", 1)[1].strip()
+        state[chat_id] = {"step": "reply", "to": to}
+        return send(chat_id, "Введите ответ для <code>%s</code>. Напишите «отмена», чтобы выйти." % to,
+                    [[{"text": "Отмена", "callback_data": "cancelreply"}]])
+    if data == "cancelreply" and is_admin(chat_id):
+        state.pop(chat_id, None)
+        return send(chat_id, "Ответ отменён.", [[{"text": "В меню", "callback_data": "menu"}]])
     if data.startswith("svc:"):
         return show_service(chat_id, data[4:])
     if data.startswith("buy:"):
