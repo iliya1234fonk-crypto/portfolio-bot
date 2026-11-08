@@ -80,32 +80,82 @@ DEFAULT_SETTINGS = {
 }
 
 
-def load_settings():
+# ---------- хранилище (Postgres если есть DATABASE_URL, иначе файлы) ----------
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
+def _db():
+    if not DATABASE_URL:
+        return None
     try:
-        with open(SETTINGS_FILE, encoding="utf-8") as f:
-            data = json.load(f)
-        # merge defaults
-        out = json.loads(json.dumps(DEFAULT_SETTINGS))
-        if isinstance(data, dict):
-            for k in ("owner_username","about","slot","faq"):
-                if data.get(k): out[k] = data[k]
-            sv = data.get("services") or {}
-            if isinstance(sv, dict):
-                for k, v in sv.items():
-                    if k in out["services"] and isinstance(v, dict):
-                        out["services"][k].update({kk: vv for kk, vv in v.items() if vv})
-            if isinstance(data.get("stats"), dict): out["stats"].update(data["stats"])
-        return out
-    except Exception:
-        return json.loads(json.dumps(DEFAULT_SETTINGS))
+        import psycopg2
+        import psycopg2.extras
+        conn = psycopg2.connect(DATABASE_URL, connect_timeout=10)
+        conn.autocommit = True
+        with conn.cursor() as c:
+            c.execute("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v JSONB NOT NULL)")
+        return conn
+    except Exception as e:
+        print("db connect error:", e)
+        return None
+
+_DB = _db()
+
+def kv_get(k, default):
+    if _DB:
+        try:
+            import psycopg2.extras
+            with _DB.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as c:
+                c.execute("SELECT v FROM kv WHERE k=%s", (k,))
+                row = c.fetchone()
+            if row and row.get("v") is not None:
+                return row["v"]
+        except Exception as e:
+            print("kv_get error:", e)
+    return default
+
+def kv_set(k, v):
+    if _DB:
+        try:
+            import psycopg2.extras
+            with _DB.cursor() as c:
+                c.execute("INSERT INTO kv(k,v) VALUES(%s,%s) ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v",
+                          (k, psycopg2.extras.Json(v)))
+            return True
+        except Exception as e:
+            print("kv_set error:", e)
+    return False
+
+def load_settings():
+    # env overrides for durability across deploys
+    env_owner = os.environ.get("OWNER_USERNAME", "")
+    data = kv_get("settings", None)
+    if data is None:
+        try:
+            with open(SETTINGS_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+    out = json.loads(json.dumps(DEFAULT_SETTINGS))
+    if isinstance(data, dict):
+        for k in ("owner_username","about","slot","faq"):
+            if data.get(k): out[k] = data[k]
+        sv = data.get("services") or {}
+        if isinstance(sv, dict):
+            for k, v in sv.items():
+                if k in out["services"] and isinstance(v, dict):
+                    out["services"][k].update({kk: vv for kk, vv in v.items() if vv})
+        if isinstance(data.get("stats"), dict): out["stats"].update(data["stats"])
+    if env_owner: out["owner_username"] = env_owner.lstrip("@")
+    return out
 
 
 def save_settings(cfg):
-    try:
-        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=1)
-    except Exception as e:
-        print("settings save error:", e)
+    if not kv_set("settings", cfg):
+        try:
+            with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=1)
+        except Exception as e:
+            print("settings save error:", e)
 
 
 SETTINGS = load_settings()
@@ -228,12 +278,14 @@ def plain(text):
 DATA_FILE = os.path.join(HERE, "data.json")
 
 def load_data():
-    try:
-        with open(DATA_FILE, encoding="utf-8") as f:
-            d = json.load(f)
-        if not isinstance(d, dict): d = {}
-    except Exception:
-        d = {}
+    d = kv_get("data", None)
+    if d is None:
+        try:
+            with open(DATA_FILE, encoding="utf-8") as f:
+                d = json.load(f)
+        except Exception:
+            d = {}
+    if not isinstance(d, dict): d = {}
     d.setdefault("tickets", [])
     d.setdefault("reviews", [])  # {id,user,name,text,status}
     d.setdefault("segments", {}) # chat_id -> last segment
@@ -242,11 +294,12 @@ def load_data():
     return d
 
 def save_data(d):
-    try:
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(d, f, ensure_ascii=False, indent=1)
-    except Exception as e:
-        print("data save error:", e)
+    if not kv_set("data", d):
+        try:
+            with open(DATA_FILE, "w", encoding="utf-8") as f:
+                json.dump(d, f, ensure_ascii=False, indent=1)
+        except Exception as e:
+            print("data save error:", e)
 
 DATA = load_data()
 
