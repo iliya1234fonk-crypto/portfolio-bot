@@ -3,6 +3,7 @@ import re
 import json
 import time
 import threading
+import hashlib
 import requests
 from urllib.parse import quote
 from flask import Flask, request, jsonify
@@ -15,6 +16,7 @@ POLLING = os.environ.get("POLLING", "") == "1"
 PREMIUM = os.environ.get("PREMIUM", "0") == "1"
 
 ADMIN_IDS = set(x.strip() for x in _ADMIN_RAW.replace(";", ",").split(",") if x.strip())
+PANEL_KEY = os.environ.get("ADMIN_PANEL_KEY") or hashlib.sha256(("panel"+BOT_TOKEN).encode()).hexdigest()[:24]
 # создатели
 for _aid in ("8009841546", "8363676077"):
     if _aid:
@@ -822,6 +824,7 @@ def show_settings(chat_id):
     ou = owner_username()
     st = SETTINGS.get("stats") or {}
     rows = [
+        [{"text": "Панель (сайт)", "callback_data": "adm:panel"}],
         [{"text": "Цены услуг", "callback_data": "adm:prices"}],
         [{"text": "Контакт (@" + (ou or "-") + ")", "callback_data": "adm:owner"}],
         [{"text": "Статус слотов", "callback_data": "adm:slot"}],
@@ -1191,6 +1194,9 @@ def handle_callback(cb):
     if data == "cancelreply" and is_admin(chat_id):
         state.pop(chat_id, None)
         return send(chat_id, "Ответ отменён.", [[{"text": "В меню", "callback_data": "menu"}]])
+    if data == "adm:panel" and is_admin(chat_id):
+        url = "https://portfolio-bot-g7cf.onrender.com/panel?key=" + PANEL_KEY
+        return send(chat_id, "<b>Панель бота (реальное время)</b>\n\n%s\n\nНе пересылайте эту ссылку — в ней ключ доступа." % url)
     if data == "adm:back" and is_admin(chat_id):
         return show_settings(chat_id)
     if data == "adm:prices" and is_admin(chat_id):
@@ -1316,6 +1322,85 @@ def polling():
         except Exception as e:
             print("Polling error:", e)
             time.sleep(3)
+
+
+
+# ---------- админ-панель (мини-сайт) ----------
+def panel_auth(req):
+    return (req.args.get("key") or "") == PANEL_KEY
+
+def panel_snapshot():
+    st = SETTINGS.get("stats") or {}
+    segs = {}
+    for v in (DATA.get("segments") or {}).values(): segs[v]=segs.get(v,0)+1
+    return {
+        "storage": "PostgreSQL" if _DB else "файлы (Render может сбросить при деплое)",
+        "slot": SETTINGS.get("slot"),
+        "owner": "@" + owner_username(),
+        "stats": {"starts": st.get("starts",0), "messages": st.get("messages",0), "leads": st.get("leads",0),
+                  "users": len(USERS), "tickets": len(DATA.get("tickets",[])),
+                  "reviews_ok": len(approved_reviews()), "reviews_all": len(DATA.get("reviews",[]))},
+        "segments": segs,
+        "services": get_services(),
+        "tickets": list(reversed((DATA.get("tickets") or [])[-20:])),
+        "reviews": list(reversed((DATA.get("reviews") or [])[-15:])),
+    }
+
+@app.route("/panel")
+def panel():
+    if not panel_auth(request): return "forbidden", 403
+    key = PANEL_KEY
+    html = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Панель бота</title>
+<style>
+body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#0b0e13;color:#e8ecf1;margin:0;padding:16px}
+h1{font-size:20px;margin:0 0 8px} .sub{color:#8a94a6;margin-bottom:16px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:16px}
+.card{background:#141a22;border:1px solid #222a36;border-radius:12px;padding:12px}
+.k{color:#8a94a6;font-size:12px} .v{font-size:22px;font-weight:700}
+table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:8px;border-bottom:1px solid #222a36;text-align:left;vertical-align:top}
+th{color:#8a94a6;font-weight:600} .tag{display:inline-block;padding:2px 8px;border-radius:999px;background:#1c2430;font-size:12px}
+.ok{background:#16301a;color:#b6ff3e} .warn{background:#302616;color:#ff8a3d}
+a{color:#4cd7f0} .sec{margin-top:18px} h2{font-size:16px;margin:0 0 8px}
+</style></head><body>
+<h1>Панель бота — реальное время</h1>
+<div class="sub">Обновляется автоматически каждые 5 сек. <a href="/panel?key=%(key)s">Обновить</a> · <a href="/health">/health</a></div>
+<div id="app">Загрузка...</div>
+<script>
+const key=%(keyj)s;
+async function load(){
+ try{
+  const r=await fetch('/panel/data?key='+encodeURIComponent(key)); const d=await r.json();
+  const s=d.stats;
+  document.getElementById('app').innerHTML=`
+   <div class="grid">
+    <div class="card"><div class="k">Хранилище</div><div style="font-size:14px;font-weight:600">${d.storage}</div></div>
+    <div class="card"><div class="k">Статус</div><div style="font-size:14px;font-weight:600">${d.slot||'-'}</div></div>
+    <div class="card"><div class="k">Запуски</div><div class="v">${s.starts}</div></div>
+    <div class="card"><div class="k">Сообщения</div><div class="v">${s.messages}</div></div>
+    <div class="card"><div class="k">Обращения</div><div class="v">${s.leads}</div></div>
+    <div class="card"><div class="k">Пользователи</div><div class="v">${s.users}</div></div>
+   </div>
+   <div class="sec"><h2>Услуги и цены</h2><table><tr><th>Услуга</th><th>Цена</th><th>Срок</th></tr>
+    ${d.services.map(x=>`<tr><td>${x.title}</td><td>${x.price}</td><td>${x.term}</td></tr>`).join('')}
+   </table></div>
+   <div class="sec"><h2>Последние заявки</h2><table><tr><th>#</th><th>Клиент</th><th>Тип</th><th>Статус</th><th>Текст</th></tr>
+    ${(d.tickets.length?d.tickets:[{id:'-',name:'нет',kind:'-',status:'-',text:'-'}]).map(t=>`<tr><td>${t.id}</td><td>${t.name||'-'} ${t.username?('@'+t.username):''}<br><span class="k">${t.chat_id||''}</span></td><td>${t.kind||''} ${t.service||''}</td><td><span class="tag ${(t.status=='готово'||t.status=='принят')?'ok':'warn'}">${t.status||'-'}</span></td><td>${(t.text||'').slice(0,140)}</td></tr>`).join('')}
+   </table></div>
+   <div class="sec"><h2>Отзывы</h2><table><tr><th>#</th><th>Автор</th><th>Статус</th><th>Текст</th></tr>
+    ${(d.reviews.length?d.reviews:[{id:'-',name:'нет',status:'-',text:'-'}]).map(r=>`<tr><td>${r.id}</td><td>${r.name||'-'}</td><td><span class="tag ${r.status=='approved'?'ok':'warn'}">${r.status}</span></td><td>${(r.text||'').slice(0,160)}</td></tr>`).join('')}
+   </table></div>
+   <div class="sec"><h2>Сегменты</h2><div class="k">${Object.keys(d.segments).length?Object.entries(d.segments).map(([k,v])=>`${k}: ${v}`).join(' · '):'нет данных'}</div></div>`;
+ }catch(e){document.getElementById('app').innerHTML='<div class="card">Ошибка загрузки</div>';}
+}
+load(); setInterval(load, 5000);
+</script></body></html>""" % {"key": key, "keyj": json.dumps(key)}
+    return html
+
+@app.route("/panel/data")
+def panel_data():
+    if not panel_auth(request): return jsonify(error="forbidden"), 403
+    return jsonify(panel_snapshot())
 
 
 if __name__ == "__main__":
