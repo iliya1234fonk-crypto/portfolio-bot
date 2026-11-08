@@ -1358,7 +1358,7 @@ h1{font-size:20px;margin:0 0 8px} .sub{color:#8a94a6;margin-bottom:16px}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:16px}
 .card{background:#141a22;border:1px solid #222a36;border-radius:12px;padding:12px}
 .k{color:#8a94a6;font-size:12px} .v{font-size:22px;font-weight:700}
-table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:8px;border-bottom:1px solid #222a36;text-align:left;vertical-align:top}
+table{width:100%%;border-collapse:collapse;font-size:13px} th,td{padding:8px;border-bottom:1px solid #222a36;text-align:left;vertical-align:top}
 th{color:#8a94a6;font-weight:600} .tag{display:inline-block;padding:2px 8px;border-radius:999px;background:#1c2430;font-size:12px}
 .ok{background:#16301a;color:#b6ff3e} .warn{background:#302616;color:#ff8a3d}
 a{color:#4cd7f0} .sec{margin-top:18px} h2{font-size:16px;margin:0 0 8px}
