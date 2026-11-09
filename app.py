@@ -842,6 +842,43 @@ def show_price_settings(chat_id):
     rows.append([{"text": "Назад", "callback_data": "adm:back"}])
     send(chat_id, "<b>Цены услуг</b>\n\nНажмите на услугу, чтобы изменить цену.", keyboard=rows)
 
+
+ADMIN_HELP = (
+"<b>Команды админов</b>\n\n"
+"<b>Основное</b>\n"
+"/admin — админ-панель в боте (меню)\n"
+"/settings — настройки (цены, контакт, слот, статистика, панель)\n"
+"/panel — ссылка на мини-сайт реального времени\n"
+"/help_admin — этот список\n\n"
+"<b>Заявки и клиенты</b>\n"
+"/tickets — последние заявки\n"
+"/ticket ID — карточка заявки\n"
+"/setstatus ID статус — статус заявки (новый/принят/в работе/готово)\n"
+"/note ID текст — заметка по клиенту (chat_id или ID заявки)\n"
+"/notes ID — показать заметку\n"
+"/who CHAT_ID — данные пользователя/сегмент/заметка\n"
+"/say CHAT_ID текст — написать пользователю от имени бота\n\n"
+"<b>Отзывы</b>\n"
+"/reviews — последние отзывы\n"
+"/reviews_pending — отзывы на модерации\n\n"
+"<b>Рассылки и аудитория</b>\n"
+"/users — количество и последние пользователи\n"
+"/segments — сегменты аудитории\n"
+"/rassylka [сегмент] — рассылка всем или по сегменту (bots/sites/catalog/brief)\n\n"
+"<b>Статистика и данные</b>\n"
+"/stats — статистика\n"
+"/export — экспорт настроек (JSON)\n"
+"/exportdata — экспорт заявок/отзывов (сводка)\n\n"
+"<b>Быстрые настройки</b>\n"
+"/setslot текст — статус слотов (принимаю/занят)\n"
+"/setowner username — контакт без @\n"
+"/faq — показать текущий FAQ/статус\n\n"
+"<b>Служебное</b>\n"
+"/links — ссылки на услуги\n"
+"/id — ваш chat_id\n"
+"/ping — проверка бота\n"
+)
+
 # ---------- обработка ----------
 def handle_message(msg):
     chat_id = msg["chat"]["id"]
@@ -960,6 +997,96 @@ def handle_message(msg):
         return send_photo_file(chat_id, TRUST_CAPTION, rows, "trust.jpg")
     if text == "/contact":
         return send_photo_file(chat_id, contact_text(), contact_kb(), "scr_contact.jpg")
+
+    if text == "/help_admin" and is_admin(chat_id):
+        return send(chat_id, ADMIN_HELP)
+    if text in ("/admin","/panelcmd") and is_admin(chat_id):
+        return show_settings(chat_id)
+    if text == "/panel" and is_admin(chat_id):
+        url = "https://portfolio-bot-g7cf.onrender.com/panel?key=" + PANEL_KEY
+        return send(chat_id, "<b>Панель (реальное время)</b>\n%s\n\nНе пересылать." % url)
+    if text == "/ping" and is_admin(chat_id):
+        return send(chat_id, "ok · %s · хранение: %s" % (time.strftime("%H:%M:%S"), "PostgreSQL" if _DB else "файлы"))
+    if text == "/users" and is_admin(chat_id):
+        last = list(USERS.items())[-15:]
+        return send(chat_id, "<b>Пользователи:</b> %s\n\n%s" % (len(USERS), "\n".join("%s — %s"%(k,v) for k,v in last) or "-"))
+    if text == "/segments" and is_admin(chat_id):
+        segs={}
+        for v in (DATA.get("segments") or {}).values(): segs[v]=segs.get(v,0)+1
+        return send(chat_id, "<b>Сегменты</b>\n\n" + ("\n".join("• %s: %s"%(k,v) for k,v in segs.items()) or "нет данных"))
+    if text == "/stats" and is_admin(chat_id):
+        st=SETTINGS.get("stats") or {}
+        return send(chat_id, "<b>Статистика</b>\nЗапуски: %s\nСообщения: %s\nОбращения: %s\nПользователи: %s\nЗаявки: %s\nОтзывы: %s/%s" % (st.get("starts",0),st.get("messages",0),st.get("leads",0),len(USERS),len(DATA.get("tickets",[])),len(approved_reviews()),len(DATA.get("reviews",[]))))
+    if text == "/tickets" and is_admin(chat_id):
+        ts = list(reversed((DATA.get("tickets") or [])[-15:]))
+        if not ts: return send(chat_id, "Заявок нет.")
+        lines=["<b>Последние заявки</b>"]
+        for t in ts:
+            lines.append("#%s [%s] %s %s — %s" % (t["id"], t.get("status"), t.get("name"), t.get("kind"), (t.get("text") or "")[:70]))
+        lines.append("\n/ticket ID — подробнее, /setstatus ID статус")
+        return send(chat_id, "\n".join(lines))
+    if text.startswith("/ticket ") and is_admin(chat_id):
+        tid = text.split(None,1)[1].strip()
+        t = find_ticket(tid)
+        if not t: return send(chat_id, "Заявка не найдена.")
+        note = (DATA.get("notes") or {}).get(str(t.get("chat_id")),"")
+        kb=[reply_kb(t.get("chat_id"))[0],[{"text":"Принят","callback_data":"tstat:%s:принят"%tid},{"text":"В работе","callback_data":"tstat:%s:в работе"%tid},{"text":"Готово","callback_data":"tstat:%s:готово"%tid}]]
+        return send(chat_id, "<b>Заявка #%s</b> [%s]\n%s (@%s) <code>%s</code>\n%s\n\n%s\n\nЗаметка: %s" % (t["id"],t.get("status"),t.get("name"),t.get("username"),t.get("chat_id"),t.get("kind"),t.get("text"),note or "-"), keyboard=kb)
+    if text.startswith("/setstatus ") and is_admin(chat_id):
+        p=text.split(None,2)
+        if len(p)<3: return send(chat_id, "Формат: /setstatus ID статус")
+        t=set_ticket_status(p[1], p[2])
+        if t:
+            send(t["chat_id"], "<b>Статус заявки #%s:</b> %s" % (t["id"], p[2]), keyboard=[[{"text":"Ответить в боте","callback_data":"ask"}]])
+            notify_change(user.get("username") or "admin", "Статус заявки", "#%s → %s" % (p[1], p[2]))
+            return send(chat_id, "Ок: #%s → %s" % (p[1], p[2]))
+        return send(chat_id, "Заявка не найдена.")
+    if text.startswith("/note ") and is_admin(chat_id):
+        p=text.split(None,2)
+        if len(p)<3: return send(chat_id, "Формат: /note CHAT_ID_или_ID_заявки текст")
+        key=p[1]; note=p[2]; t=find_ticket(key)
+        if t: key=str(t.get("chat_id"))
+        DATA.setdefault("notes",{})[str(key)] = note; save_data(DATA)
+        return send(chat_id, "Заметка сохранена для %s." % key)
+    if text.startswith("/notes ") and is_admin(chat_id):
+        key=text.split(None,1)[1].strip(); t=find_ticket(key)
+        if t: key=str(t.get("chat_id"))
+        return send(chat_id, "Заметка %s:\n%s" % (key, (DATA.get("notes") or {}).get(str(key), "-")))
+    if text.startswith("/who ") and is_admin(chat_id):
+        key=text.split(None,1)[1].strip()
+        seg=(DATA.get("segments") or {}).get(str(key),"-"); note=(DATA.get("notes") or {}).get(str(key),"-"); name=USERS.get(str(key),"-")
+        ts=[t for t in DATA.get("tickets",[]) if str(t.get("chat_id"))==str(key)]
+        return send(chat_id, "<b>Пользователь</b> <code>%s</code> (%s)\nСегмент: %s\nЗаметка: %s\nЗаявок: %s" % (key,name,seg,note,len(ts)), keyboard=reply_kb(key))
+    if text.startswith("/say ") and is_admin(chat_id):
+        p=text.split(None,2)
+        if len(p)<3: return send(chat_id, "Формат: /say CHAT_ID текст")
+        send(p[1], "<b>Сообщение</b>\n\n%s" % p[2], keyboard=[[{"text":"Ответить в боте","callback_data":"ask"}]])
+        return send(chat_id, "Отправлено %s." % p[1])
+    if text == "/reviews" and is_admin(chat_id):
+        rs=list(reversed((DATA.get("reviews") or [])[-10:]))
+        if not rs: return send(chat_id, "Отзывов нет.")
+        return send(chat_id, "<b>Отзывы</b>\n\n" + "\n\n".join("#%s [%s] %s: %s"%(r["id"],r.get("status"),r.get("name"),(r.get("text") or "")[:120]) for r in rs))
+    if text == "/reviews_pending" and is_admin(chat_id):
+        rs=[r for r in DATA.get("reviews",[]) if r.get("status")=="pending"]
+        if not rs: return send(chat_id, "Нет отзывов на модерации.")
+        for r in rs[-10:]:
+            send(chat_id, "#%s %s: %s"%(r["id"],r.get("name"),r.get("text")), keyboard=[[{"text":"Опубликовать","callback_data":"revok:%s"%r["id"]},{"text":"Отклонить","callback_data":"revno:%s"%r["id"]}]])
+        return
+    if text == "/export" and is_admin(chat_id):
+        return send(chat_id, "<b>settings.json</b>\n<pre>%s</pre>" % json.dumps(SETTINGS, ensure_ascii=False, indent=1)[:3800])
+    if text == "/exportdata" and is_admin(chat_id):
+        summ={"tickets":len(DATA.get("tickets",[])),"reviews":len(DATA.get("reviews",[])),"users":len(USERS),"segments":DATA.get("segments",{})}
+        return send(chat_id, "<b>data (сводка)</b>\n<pre>%s</pre>" % json.dumps(summ, ensure_ascii=False, indent=1)[:3800])
+    if text.startswith("/setslot ") and is_admin(chat_id):
+        old=SETTINGS.get("slot"); SETTINGS["slot"]=text.split(None,1)[1]; save_settings(SETTINGS)
+        notify_change(user.get("username") or "admin", "Статус изменён", "Было: %s\nСтало: %s" % (old, SETTINGS["slot"]))
+        return send(chat_id, "Статус: %s" % SETTINGS["slot"])
+    if text.startswith("/setowner ") and is_admin(chat_id):
+        old=owner_username(); SETTINGS["owner_username"]=text.split(None,1)[1].lstrip("@"); save_settings(SETTINGS)
+        notify_change(user.get("username") or "admin", "Контакт изменён", "Было: @%s\nСтало: @%s" % (old, owner_username()))
+        return send(chat_id, "Контакт: @%s" % owner_username())
+    if text == "/faq" and is_admin(chat_id):
+        return send(chat_id, "<b>Статус:</b> %s\n\n<b>FAQ</b>\n%s" % (SETTINGS.get("slot"), SETTINGS.get("faq")))
 
     if text == "/links" and is_admin(chat_id):
         rows = ["<b>Ссылки для постов</b>\n", "Кидай в ВК или куда угодно — человек попадёт сразу на услугу:\n"]
