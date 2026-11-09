@@ -4,6 +4,7 @@ import json
 import time
 import threading
 import hashlib
+import random
 import requests
 from urllib.parse import quote
 from flask import Flask, request, jsonify
@@ -24,7 +25,7 @@ for _aid in ("8009841546", "8363676077"):
 
 
 def is_admin(chat_id):
-    return str(chat_id) in ADMIN_IDS
+    return str(chat_id) in staff_ids()
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 EMOJI_FILE = os.path.join(HERE, "emoji_ids.json")
@@ -79,6 +80,15 @@ DEFAULT_SETTINGS = {
     "slot": "Принимаю заказы",
     "faq": "Срок: обычно 1–4 дня.\nКак работаем: обсуждаем задачу → я показываю демо → вы решаете по оплате → передаю доступ и исходники.\nПравки: мелкие правки по задаче делаю.\nЧто нужно от вас: описание, примеры/тексты (если есть), куда слать заявки.",
     "stats": {"starts": 0, "messages": 0, "leads": 0},
+    "admins": {},
+    "templates": [
+        "Уточню пару деталей и отвечу.",
+        "Могу взять эту задачу. Напишите, пожалуйста, подробности.",
+        "По срокам ориентировочно 1–2 дня.",
+        "Пришлите, пожалуйста, пример или подробнее опишите задачу.",
+    ],
+    "promos": {},
+    "antispam": {"seconds": 0.7},
 }
 
 
@@ -147,6 +157,11 @@ def load_settings():
                 if k in out["services"] and isinstance(v, dict):
                     out["services"][k].update({kk: vv for kk, vv in v.items() if vv})
         if isinstance(data.get("stats"), dict): out["stats"].update(data["stats"])
+        for _k in ("admins", "promos", "antispam"):
+            if isinstance(data.get(_k), dict):
+                out[_k].update(data[_k])
+        if isinstance(data.get("templates"), list) and data["templates"]:
+            out["templates"] = data["templates"]
     if env_owner: out["owner_username"] = env_owner.lstrip("@")
     return out
 
@@ -161,19 +176,171 @@ def save_settings(cfg):
 
 
 SETTINGS = load_settings()
+
+# ---------- администраторы, роли и права ----------
+ROLE_DEFS = {
+    "owner":   {"title": "Владелец",      "perms": ["*"],
+                "hint": "всё, включая управление админами"},
+    "admin":   {"title": "Администратор", "perms": ["panel", "stats", "tickets", "reply", "reviews",
+                                                    "notes", "users", "broadcast", "settings", "export", "ban", "pay",
+                                                    "admins_view"],
+                "hint": "всё, кроме управления админами"},
+    "manager": {"title": "Менеджер",      "perms": ["panel", "stats", "tickets", "reply", "reviews", "notes", "users"],
+                "hint": "заявки, ответы, отзывы — без цен и рассылок"},
+    "support": {"title": "Поддержка",     "perms": ["tickets", "reply", "notes"],
+                "hint": "только ответы клиентам и заметки"},
+    "viewer":  {"title": "Наблюдатель",   "perms": ["stats"],
+                "hint": "только смотреть статистику"},
+}
+
+PERM_TITLES = {
+    "panel": "Панель (сайт)",
+    "stats": "Статистика",
+    "tickets": "Заявки",
+    "reply": "Ответы клиентам",
+    "reviews": "Отзывы",
+    "notes": "Заметки",
+    "users": "Пользователи",
+    "broadcast": "Рассылки",
+    "settings": "Настройки, цены, тексты",
+    "export": "Экспорт данных",
+    "ban": "Баны и антиспам",
+    "pay": "Счета и оплата",
+    "admins_view": "Список админов",
+    "admins": "Управление админами",
+}
+
+
+def staff_map():
+    """chat_id -> {role, name, extra, deny, root}"""
+    base = dict(SETTINGS.get("admins") or {})
+    for cid in ADMIN_IDS:
+        v = base.setdefault(str(cid), {})
+        if v.get("role") in (None, ""):
+            v["role"] = "owner"
+        v["root"] = True
+    return {str(k): v for k, v in base.items()}
+
+
+def staff_ids():
+    ids = list(staff_map().keys())
+    return ids
+
+
+def perms_of(chat_id):
+    v = staff_map().get(str(chat_id))
+    if not v:
+        return set()
+    if v.get("root") or v.get("role") == "owner":
+        return set(PERM_TITLES.keys())
+    p = set(ROLE_DEFS.get(v.get("role"), {}).get("perms", []))
+    p |= set(v.get("extra") or [])
+    p -= set(v.get("deny") or [])
+    return p
+
+
+def can(chat_id, perm):
+    return perm in perms_of(chat_id)
+
+
+def role_title(role):
+    return ROLE_DEFS.get(role, {}).get("title", role or "-")
+
+
+def admin_name(chat_id):
+    v = staff_map().get(str(chat_id)) or {}
+    if v.get("name"):
+        return v["name"]
+    u = USERS.get(str(chat_id))
+    if u:
+        return "@" + str(u) if not str(u).startswith("@") else str(u)
+    return str(chat_id)
+
+
+def admins_text():
+    lines = ["<b>Администраторы</b>\n"]
+    for cid, v in staff_map().items():
+        mark = " ★" if v.get("root") else ""
+        lines.append("• <code>%s</code> — %s (%s)%s" % (cid, admin_name(cid), role_title(v.get("role")), mark))
+    lines.append("\n★ — создатели, их нельзя удалить или понизить.")
+    lines.append("Изменить: /admin_role ID роль · /admin_perm ID право on|off")
+    return "\n".join(lines)
+
+
+def save_admins():
+    save_settings(SETTINGS)
+
+
+def set_admin(cid, role, name=""):
+    cid = str(cid)
+    if role not in ROLE_DEFS:
+        return False, "Неизвестная роль. Есть: " + ", ".join(ROLE_DEFS.keys())
+    m = staff_map()
+    if m.get(cid, {}).get("root") and role != "owner":
+        return False, "Создателя нельзя понизить."
+    v = dict(SETTINGS.setdefault("admins", {}).get(cid) or {})
+    v["role"] = role
+    if name:
+        v["name"] = name
+    v.pop("root", None)
+    SETTINGS["admins"][cid] = v
+    save_admins()
+    return True, "%s теперь %s" % (cid, role_title(role))
+
+
+def drop_admin(cid):
+    cid = str(cid)
+    if staff_map().get(cid, {}).get("root"):
+        return False, "Создателя нельзя удалить."
+    SETTINGS.setdefault("admins", {}).pop(cid, None)
+    save_admins()
+    return True, "Админ %s удалён" % cid
+
+
+def toggle_perm(cid, perm, on):
+    cid = str(cid)
+    if perm not in PERM_TITLES:
+        return False, "Нет такого права. Есть: " + ", ".join(PERM_TITLES.keys())
+    v = SETTINGS.setdefault("admins", {}).setdefault(cid, {})
+    v.setdefault("role", "manager")
+    extra = set(v.get("extra") or [])
+    deny = set(v.get("deny") or [])
+    if on:
+        extra.add(perm); deny.discard(perm)
+    else:
+        deny.add(perm); extra.discard(perm)
+    v["extra"] = sorted(extra); v["deny"] = sorted(deny)
+    save_admins()
+    return True, "%s: %s %s" % (cid, PERM_TITLES[perm], "включено" if on else "выключено")
+
+
+def denied_text():
+    return "Недоступно для вашей роли. Права: /myrights"
+
 _LAST_MSG = {}
 
 def rate_ok(chat_id):
     now = time.time()
     k = str(chat_id)
     last = _LAST_MSG.get(k, 0)
-    if now - last < 0.7:
+    try:
+        gap = float((SETTINGS.get("antispam") or {}).get("seconds", 0.7))
+    except Exception:
+        gap = 0.7
+    if now - last < gap:
         return False
     _LAST_MSG[k] = now
     return True
 
 def bump_stat(key):
     try:
+        try:
+            _d = DATA.setdefault("daily", {}).setdefault(time.strftime("%Y-%m-%d"), {})
+            _d[key] = int(_d.get(key, 0)) + 1
+            if _d[key] % 10 == 0:
+                save_data(DATA)
+        except Exception:
+            pass
         SETTINGS.setdefault("stats", {}).setdefault(key, 0)
         SETTINGS["stats"][key] += 1
         # save occasionally not every time? keep simple
@@ -190,7 +357,7 @@ def owner_username():
 def _make_change_photo(title, details):
     try:
         from PIL import Image, ImageDraw, ImageFont
-        FONT = "/tmp/Onest.ttf"
+        FONT = _asset("Onest.ttf") or "/tmp/Onest.ttf"
         W, H = 1280, 720
         def fnt(size, weight=700):
             f = ImageFont.truetype(FONT, size)
@@ -238,7 +405,7 @@ def _make_change_photo(title, details):
 def notify_change(who_name, title, details):
     caption = "<b>%s</b>\n\n%s\n\nИзменил: %s" % (title, details, who_name)
     photo = _make_change_photo(title, details)
-    for aid in ADMIN_IDS:
+    for aid in staff_ids():
         if photo:
             send_photo_file(aid, caption, None, os.path.basename(photo))
         else:
@@ -324,7 +491,10 @@ def add_ticket(chat_id, user, kind, text, service=""):
 def set_ticket_status(tid, status):
     for t in DATA.get("tickets", []):
         if str(t.get("id")) == str(tid):
-            t["status"] = status; save_data(DATA); return t
+            t["status"] = status
+            if status == "готово":
+                t["done_ts"] = int(time.time())
+            save_data(DATA); return t
     return None
 
 def find_ticket(tid):
@@ -587,6 +757,7 @@ EXAMPLES_ASK = (
 EXAMPLES_KB = [
     [{"text": "Примеры ботов", "callback_data": "ex_bots"}],
     [{"text": "Примеры сайтов", "callback_data": "ex_sites"}],
+    [{"text": "Свежие работы", "callback_data": "ex_more"}],
     [{"text": "В меню", "callback_data": "menu"}],
 ]
 
@@ -671,6 +842,7 @@ def catalog_kb():
     for s in get_services():
         rows.append([{"text": "%s · %s" % (s["title"], s["price"]), "callback_data": "svc:" + s["id"]}])
     rows.append([{"text": "Свой вариант", "callback_data": "svc:custom"}])
+    rows.append([{"text": "Рассчитать стоимость", "callback_data": "calc"}])
     rows.append([{"text": "Предложить свою цену", "callback_data": "bargain"}])
     rows.append([{"text": "В меню", "callback_data": "menu"}])
     return rows
@@ -738,7 +910,7 @@ def reply_kb(chat_id):
 
 def notify_admin(text, reply_to=None):
     kb = reply_kb(reply_to) if reply_to else None
-    for aid in ADMIN_IDS:
+    for aid in staff_ids():
         send(aid, text, keyboard=kb)
 
 
@@ -825,10 +997,12 @@ def show_settings(chat_id):
     st = SETTINGS.get("stats") or {}
     rows = [
         [{"text": "Панель (сайт)", "callback_data": "adm:panel"}],
+        [{"text": "Админы и права", "callback_data": "adm:admins"}],
         [{"text": "Цены услуг", "callback_data": "adm:prices"}],
         [{"text": "Контакт (@" + (ou or "-") + ")", "callback_data": "adm:owner"}],
         [{"text": "Статус слотов", "callback_data": "adm:slot"}],
         [{"text": "Статистика", "callback_data": "adm:stats"}],
+        [{"text": "Ещё", "callback_data": "adm:more"}],
         [{"text": "В меню", "callback_data": "menu"}],
     ]
     send(chat_id, "<b>Настройки бота</b>\n\nСтатус: %s\nЗапусков: %s · Сообщений: %s · Обращений: %s\n\nКаждое изменение придёт всем администраторам с уведомлением." % (
@@ -843,64 +1017,102 @@ def show_price_settings(chat_id):
     send(chat_id, "<b>Цены услуг</b>\n\nНажмите на услугу, чтобы изменить цену.", keyboard=rows)
 
 
-GUIDES = [('v2_0_hero.jpg', '<b>Инструкция 1/5 — обзор</b>\nКак устроена админ-система: бот, панель, ответы, уведомления.'), ('v2_1_osnovnoe.jpg', '<b>Инструкция 2/5 — основное и заявки</b>\nС чего начать и как вести заказы.'), ('v2_2_klienty.jpg', '<b>Инструкция 3/5 — клиенты, отзывы, рассылки</b>\nЗаметки, модерация, сегменты и аудитория.'), ('v2_3_nastroyki.jpg', '<b>Инструкция 4/5 — статистика и настройки</b>\nЦифры, цены, тексты и статусы бота.'), ('v2_4_service.jpg', '<b>Инструкция 5/5 — служебное и шпаргалка</b>\nМелочи, которые экономят время.')]
+GUIDES = [
+    ("v3_1_admins.jpg", "<b>Инструкция 1/5 — админы и права</b>\nКак добавить человека и выдать нужный доступ."),
+    ("v3_2_roles.jpg", "<b>Инструкция 2/5 — роли и права</b>\nЧто может владелец, админ, менеджер, поддержка и наблюдатель."),
+    ("v3_3_features.jpg", "<b>Инструкция 3/5 — калькулятор, промо, оплата</b>\nЧто видит и использует клиент."),
+    ("v3_4_panel.jpg", "<b>Инструкция 4/5 — панель 2.0</b>\nВход по коду и действия прямо с сайта."),
+    ("v3_5_polza.jpg", "<b>Инструкция 5/5 — баны, шаблоны, примеры</b>\nМелочи для порядка и скорости."),
+]
+
+# все листы: базовые v2 + новые v3
+GUIDES_ALL = [
+    ("v2_0_hero.jpg", "<b>Обзор — 1/5</b>\nКак устроена админ-система."),
+    ("v2_1_osnovnoe.jpg", "<b>Основное и заявки — 2/5</b>\nС чего начать и как вести заказы."),
+    ("v2_2_klienty.jpg", "<b>Клиенты, отзывы, рассылки — 3/5</b>\nЗаметки, модерация, сегменты."),
+    ("v2_3_nastroyki.jpg", "<b>Статистика и настройки — 4/5</b>\nЦифры, цены, тексты, статусы."),
+    ("v2_4_service.jpg", "<b>Служебное — 5/5</b>\nМелочи, которые экономят время."),
+    ("v3_1_admins.jpg", "<b>Админы и права — 1/5</b>\nДобавить человека и выдать доступ."),
+    ("v3_2_roles.jpg", "<b>Роли и права — 2/5</b>\nКто что может."),
+    ("v3_3_features.jpg", "<b>Калькулятор, промо, оплата — 3/5</b>\nЧто видит клиент."),
+    ("v3_4_panel.jpg", "<b>Панель 2.0 — 4/5</b>\nВход по коду и действия с сайта."),
+    ("v3_5_polza.jpg", "<b>Баны, шаблоны, примеры — 5/5</b>\nПорядок и скорость."),
+]
 
 ADMIN_HELP = (
-"<b>Команды админов (все)</b>\n\n"
-"<b>Основное</b>\n"
-"/admin /settings — админ-меню\n"
-"/panel — мини-сайт реального времени\n"
-"/help_admin — все команды\n"
-"/guides — прислать все фото-инструкции\n"
-"/guide N — одна инструкция (1..5)\n"
-"/ping — проверка, время, хранилище\n"
-"/healthcheck — быстрая диагностика\n"
-"/db — статус БД/хранилища\n"
-"/id — ваш chat_id\n\n"
+"<b>Команды админов</b>\n\n"
+"<b>Старт</b>\n"
+"/admin · /settings — админ-меню\n"
+"/help_admin — этот список\n"
+"/myrights — ваша роль и права\n"
+"/guides · /guide N — фото-инструкции (5 новых)\n"
+"/guides_all — все 10 листов\n"
+"/panel — ссылка на панель\n"
+"/panelcode — вход в панель по коду (10 мин)\n"
+"/ping · /healthcheck · /db — диагностика\n\n"
+
+"<b>Админы и права</b>\n"
+"/admins — список и управление\n"
+"/admin_add CHAT_ID роль — добавить\n"
+"/admin_role CHAT_ID роль — сменить роль\n"
+"/admin_perm CHAT_ID право on|off — точечно\n"
+"/admin_del CHAT_ID — убрать доступ\n"
+"Роли: owner, admin, manager, support, viewer\n"
+"Права: panel, stats, tickets, reply, reviews, notes,\n"
+"users, broadcast, settings, export, ban, pay,\n"
+"admins_view, admins\n\n"
+
 "<b>Заявки</b>\n"
 "/tickets — последние 15\n"
-"/ticket ID — карточка + Ответить/статусы\n"
-"/open_tickets — новые/принятые/в работе\n"
-"/done_tickets — готовые\n"
-"/findticket текст — поиск по заявкам\n"
-"/setstatus ID статус — сменить статус (+уведомление клиенту)\n"
-"/ticketmsg ID — текст заявки коротко\n\n"
-"<b>Клиенты/заметки</b>\n"
-"/who CHAT_ID — профиль, сегмент, заметка, заявки\n"
-"/note ID текст — заметка (по заявке или chat_id)\n"
-"/notes ID — заметка\n"
-"/delnote ID — удалить заметку\n"
+"/ticket ID — карточка + кнопки\n"
+"/open_tickets · /done_tickets — фильтры\n"
+"/findticket текст — поиск\n"
+"/ticketmsg ID — текст заявки\n"
+"/setstatus ID статус — новый/принят/в работе/готово\n\n"
+
+"<b>Клиенты</b>\n"
+"/who CHAT_ID — профиль и заметка\n"
+"/note ID текст · /notes ID · /delnote ID\n"
 "/say CHAT_ID текст — написать клиенту\n"
-"/clearstate CHAT_ID — сбросить состояние диалога\n\n"
+"/clearstate CHAT_ID — сбросить состояние\n"
+"/lastusers N — последние N\n\n"
+
 "<b>Отзывы</b>\n"
-"/reviews — последние\n"
-"/reviews_pending — на модерации (с кнопками)\n\n"
-"<b>Аудитория/рассылки</b>\n"
-"/users — всего и последние\n"
-"/lastusers N — последние N\n"
-"/segments — сегменты\n"
-"/rassylka [сегмент] — всем/по сегменту\n"
-"/broadcast_preview — превью текста рассылки\n\n"
-"<b>Статистика/экспорт</b>\n"
-"/stats — статистика\n"
-"/export — настройки JSON\n"
-"/exportdata — сводка данных\n"
-"/backup — экспорт настроек + сводка\n\n"
-"<b>Настройки/контент</b>\n"
-"/prices — все цены\n"
-"/setslot текст — статус слотов\n"
+"/reviews · /reviews_pending\n\n"
+
+"<b>Аудитория</b>\n"
+"/users · /segments · /refstats\n"
+"/rassylka · /rassylka bots|sites|catalog|brief\n"
+"/broadcast_preview — текст рассылки\n\n"
+
+"<b>Статистика и данные</b>\n"
+"/stats · /stats7 — за 7 дней\n"
+"/export · /exportdata · /backup\n"
+"/csv — выгрузка заявок файлом\n\n"
+
+"<b>Настройки и контент</b>\n"
+"/prices · /service ID\n"
+"/setprice_svc ID цена\n"
+"/set_title ID текст · /set_desc ID текст · /set_term ID текст\n"
+"/setslot текст · /maintenance on|off\n"
 "/setowner username — контакт\n"
-"/setfaq текст — заменить FAQ\n"
-"/setabout текст — заменить описание\n"
-"/service ID — данные услуги\n"
-"/setprice_svc ID цена — цена услуги\n"
-"/maintenance on|off — слот быстро\n"
-"/faq — показать статус+FAQ\n\n"
+"/setfaq текст · /setabout текст · /faq\n"
+"/templates · /tpl_add текст · /tpl_del N\n"
+"/promos · /promo_add КОД 10 · /promo_del КОД\n\n"
+
+"<b>Примеры работ</b>\n"
+"/addexample bots|sites — прислать фото\n"
+"/examples_list · /delexample ID\n\n"
+
+"<b>Модерация и оплата</b>\n"
+"/ban CHAT_ID причина · /unban CHAT_ID · /bans\n"
+"/antispam · /antispam_set 1.5\n"
+"/pay CHAT_ID сумма описание — счёт в Stars\n\n"
+
 "<b>Служебное</b>\n"
-"/links — deep-links услуг\n"
-"/notifyadmins текст — уведомление всем админам\n"
-"/version — версия/коммит\n"
-"/chatinfo — инфо о чате\n"
+"/links — ссылки на услуги\n"
+"/notifyadmins текст — всем админам\n"
+"/version · /chatinfo · /id · /reminders\n"
 )
 
 # ---------- обработка ----------
@@ -909,6 +1121,8 @@ def handle_message(msg):
     text = (msg.get("text") or "").strip()
     user = msg.get("from", {})
     if not rate_ok(chat_id) and not is_admin(chat_id):
+        return
+    if str(chat_id) in (DATA.get("banned") or {}) and not is_admin(chat_id):
         return
 
     try:
@@ -934,7 +1148,7 @@ def handle_message(msg):
                     kind, user.get("first_name","-"), user.get("username","-"), chat_id,
                     (msg.get("caption") or "").strip() or "(без текста)"
                 ), reply_to=chat_id)
-            for aid in ADMIN_IDS:
+            for aid in staff_ids():
                 try:
                     api("copyMessage", chat_id=aid, from_chat_id=chat_id, message_id=msg["message_id"])
                 except Exception:
@@ -943,9 +1157,14 @@ def handle_message(msg):
             return send(chat_id, "Получил, передал. Отвечу здесь, в боте.", [[{"text":"В меню","callback_data":"menu"}]], reply_keyboard=REPLY_KB)
 
 
+    if is_admin(chat_id) and text.startswith("/") and denied_cmd(chat_id, text):
+        return send(chat_id, "Недоступно для вашей роли.\n\nВаши права: /myrights")
+
     # ответ админа пользователю (внутри бота)
     if is_admin(chat_id):
         st = state.get(chat_id, {})
+        if extra_state(msg, chat_id, user, st):
+            return
         if st.get("step") == "reply" and text and not text.startswith("/"):
             if text.lower() in ("отмена", "cancel", "меню"):
                 state.pop(chat_id, None)
@@ -997,10 +1216,25 @@ def handle_message(msg):
             notify_change(who, "Статус изменён", "Было: %s\nСтало: %s" % (old, text))
             return show_settings(chat_id)
 
+    if text in ("/cancel", "/отмена") and is_admin(chat_id):
+        state.pop(chat_id, None)
+        return send(chat_id, "Отменено.")
+
+    if extra_client(text, chat_id, user):
+        return
+    if is_admin(chat_id) and extra_admin(text, chat_id, user):
+        return
+
     if text.startswith("/start"):
         state.pop(chat_id, None)
         bump_stat("starts")
         payload = text[6:].strip()
+        if payload.startswith("ref_"):
+            ref = payload[4:].strip()
+            if ref and ref != str(chat_id):
+                DATA.setdefault("refs", {})[str(chat_id)] = ref
+                save_data(DATA)
+            return show_menu(chat_id)
         if payload.startswith("order_"):
             return show_service(chat_id, payload[6:])
         return show_menu(chat_id)
@@ -1187,7 +1421,12 @@ def handle_message(msg):
     if text in ("/guides", "/guide") and is_admin(chat_id):
         for fn, cap in GUIDES:
             send_photo_file(chat_id, cap, None, "guides/" + fn)
-        return send(chat_id, "Полный список команд: /help_admin")
+        return send(chat_id, "Ещё 5 листов: /guides_all\nПолный список команд: /help_admin")
+    if text == "/guides_all" and is_admin(chat_id):
+        for fn, cap in GUIDES_ALL:
+            send_photo_file(chat_id, cap, None, "guides/" + fn)
+            time.sleep(0.4)
+        return send(chat_id, "Это все листы: 5 базовых + 5 новых.\nТочечно: /guide 1..%s" % len(GUIDES))
     if text.startswith("/guide ") and is_admin(chat_id):
         arg = text.split(None, 1)[1].strip()
         if arg.isdigit() and 1 <= int(arg) <= len(GUIDES):
@@ -1322,7 +1561,7 @@ def handle_message(msg):
         save_data(DATA)
         notify_admin("<b>НОВЫЙ ОТЗЫВ (на модерации)</b>\n\n%s (@%s)\n<code>%s</code>\n\n%s" % (user.get("first_name","-"), user.get("username","-"), chat_id, text),
                      reply_to=chat_id)
-        for aid in ADMIN_IDS:
+        for aid in staff_ids():
             send(aid, "Отзыв #%s: опубликовать?" % rid, keyboard=[[{"text":"Опубликовать","callback_data":"revok:%s"%rid},{"text":"Отклонить","callback_data":"revno:%s"%rid}]])
         return send(chat_id, "Спасибо! Отзыв отправлен на проверку.", [[{"text":"В меню","callback_data":"menu"}]], reply_keyboard=REPLY_KB)
 
@@ -1340,11 +1579,15 @@ def handle_message(msg):
         if step == "brief:3":
             b = dict(st); state.pop(chat_id, None)
             summary = "Задача: %s\nСрок/бюджет: %s\nДетали: %s" % (b.get("brief_task","-"), b.get("brief_time","-"), text)
+            _promo = (DATA.get("promo") or {}).pop(str(chat_id), None)
+            if _promo:
+                summary += "\nПромокод: %s (−%s%%)" % (_promo.get("code","").upper(), _promo.get("percent", 0))
+                save_data(DATA)
             t = add_ticket(chat_id, user, "бриф", summary)
             bump_stat("leads")
             kb = [reply_kb(chat_id)[0],
                   [{"text":"Принят","callback_data":"tstat:%s:принят"%t["id"]},{"text":"В работе","callback_data":"tstat:%s:в работе"%t["id"]},{"text":"Готово","callback_data":"tstat:%s:готово"%t["id"]}]]
-            for aid in ADMIN_IDS:
+            for aid in staff_ids():
                 send(aid, "<b>ЗАЯВКА (бриф) #%s</b>\n\n%s (@%s)\n<code>%s</code>\n\n%s" % (t["id"], user.get("first_name","-"), user.get("username","-"), chat_id, summary), keyboard=kb)
             return send(chat_id, "Заявка #%s отправлена. Я отвечу здесь, в боте." % t["id"], [[{"text":"Написать в боте","callback_data":"ask"}],[{"text":"В меню","callback_data":"menu"}]], reply_keyboard=REPLY_KB)
 
@@ -1363,6 +1606,11 @@ def handle_callback(cb):
     user = cb.get("from", {})
     data = cb.get("data", "")
     answer_cb(cb["id"])
+
+    if (data.startswith("reply:") or data.startswith("qr:")) and not can(chat_id, "reply"):
+        return send(chat_id, "Нет прав на ответы клиентам. /myrights")
+    if extra_cb(data, chat_id, user):
+        return
 
     if data == "menu":
         state.pop(chat_id, None)
@@ -1408,18 +1656,17 @@ def handle_callback(cb):
             return send(chat_id, "Недоступно.")
         to = data.split(":", 1)[1].strip()
         state[chat_id] = {"step": "reply", "to": to}
-        qr = [
-            [{"text":"Уточню детали","callback_data":"qr:%s:1"%to},{"text":"Могу взять","callback_data":"qr:%s:2"%to}],
-            [{"text":"Срок 1–2 дня","callback_data":"qr:%s:3"%to},{"text":"Пришлите пример","callback_data":"qr:%s:4"%to}],
-            [{"text":"Отмена","callback_data":"cancelreply"}],
-        ]
+        qr = []
+        for i, tpl in enumerate(templates(), start=1):
+            qr.append([{"text": tpl[:38], "callback_data": "qr:%s:%s" % (to, i)}])
+        qr.append([{"text":"Отмена","callback_data":"cancelreply"}])
         return send(chat_id, "Ответ для <code>%s</code>: выберите шаблон или напишите свой текст." % to, qr)
     if data.startswith("qr:") and is_admin(chat_id):
         parts = data.split(":")
         if len(parts) >= 3:
-            to = parts[1]; n = parts[2]
-            templates = {"1":"Уточню пару деталей и отвечу.","2":"Могу взять эту задачу. Напишите, пожалуйста, подробности.","3":"По срокам ориентировочно 1–2 дня.","4":"Пришлите, пожалуйста, пример или подробнее опишите задачу."}
-            msg = templates.get(n, "Здравствуйте!")
+            to = parts[1]; n = int(parts[2])
+            lst = templates()
+            msg = lst[n - 1] if 1 <= n <= len(lst) else "Здравствуйте!"
             send(to, "<b>Ответ от продавца</b>\n\n%s" % msg, keyboard=[[{"text":"Ответить в боте","callback_data":"ask"}]])
             state.pop(chat_id, None)
             notify_change(user.get("username") or user.get("first_name") or str(chat_id), "Быстрый ответ отправлен", "Кому: %s\nТекст: %s" % (to, msg))
@@ -1496,10 +1743,24 @@ def handle_callback(cb):
 _last_err = [0]
 def handle_update(update):
     try:
-        if "message" in update:
+        if "message" in update and update["message"].get("successful_payment"):
+            m = update["message"]; sp = m["successful_payment"]
+            amount = sp.get("total_amount", 0)
+            who = m.get("from", {})
+            DATA.setdefault("payments", []).append({"chat_id": m["chat"]["id"], "amount": amount,
+                                                    "ts": int(time.time()), "charge": sp.get("telegram_payment_charge_id", "")})
+            save_data(DATA)
+            for aid in staff_ids():
+                send(aid, "<b>Оплата получена</b>\n\n%s (@%s)\n<code>%s</code>\nСумма: %s Stars" % (
+                    who.get("first_name", "-"), who.get("username", "-"), m["chat"]["id"], amount))
+            send(m["chat"]["id"], "Оплата получена. Спасибо! Начинаю работу.")
+        elif "message" in update:
             handle_message(update["message"])
         elif "callback_query" in update:
             handle_callback(update["callback_query"])
+        elif "pre_checkout_query" in update:
+            q = update["pre_checkout_query"]
+            api("answerPreCheckoutQuery", pre_checkout_query_id=q["id"], ok=True)
     except Exception as e:
         print("Handler error:", e)
         try:
@@ -1559,81 +1820,1081 @@ def polling():
 
 
 # ---------- админ-панель (мини-сайт) ----------
+BOT_URL = "https://portfolio-bot-g7cf.onrender.com"
+
+
 def panel_auth(req):
-    return (req.args.get("key") or "") == PANEL_KEY
+    if (req.args.get("key") or "") == PANEL_KEY:
+        return True
+    code = req.args.get("code") or ""
+    if code and panel_code_ok(code):
+        PANEL_CODES.pop(str(code), None)
+        return True
+    return (req.cookies.get("panel_key") or "") == PANEL_KEY
+
 
 def panel_snapshot():
     st = SETTINGS.get("stats") or {}
     segs = {}
-    for v in (DATA.get("segments") or {}).values(): segs[v]=segs.get(v,0)+1
+    for v in (DATA.get("segments") or {}).values():
+        segs[v] = segs.get(v, 0) + 1
+    daily = DATA.get("daily") or {}
+    days = sorted(daily.keys())[-7:]
+    chart = [{"d": d[5:], "messages": daily[d].get("messages", 0), "starts": daily[d].get("starts", 0),
+              "leads": daily[d].get("leads", 0)} for d in days]
+    admins = []
+    for cid, v in staff_map().items():
+        admins.append({"id": cid, "name": admin_name(cid), "role": role_title(v.get("role")),
+                       "root": bool(v.get("root")), "perms": len(perms_of(cid))})
     return {
         "storage": "PostgreSQL" if _DB else "файлы (Render может сбросить при деплое)",
         "slot": SETTINGS.get("slot"),
         "owner": "@" + owner_username(),
-        "stats": {"starts": st.get("starts",0), "messages": st.get("messages",0), "leads": st.get("leads",0),
-                  "users": len(USERS), "tickets": len(DATA.get("tickets",[])),
-                  "reviews_ok": len(approved_reviews()), "reviews_all": len(DATA.get("reviews",[]))},
+        "stats": {"starts": st.get("starts", 0), "messages": st.get("messages", 0), "leads": st.get("leads", 0),
+                  "users": len(USERS), "tickets": len(DATA.get("tickets", [])),
+                  "reviews_ok": len(approved_reviews()), "reviews_all": len(DATA.get("reviews", []))},
         "segments": segs,
         "services": get_services(),
-        "tickets": list(reversed((DATA.get("tickets") or [])[-20:])),
-        "reviews": list(reversed((DATA.get("reviews") or [])[-15:])),
+        "chart": chart,
+        "tickets": list(reversed((DATA.get("tickets") or [])[-25:])),
+        "reviews": list(reversed((DATA.get("reviews") or [])[-12:])),
+        "admins": admins,
+        "promos": SETTINGS.get("promos") or {},
     }
 
-@app.route("/panel")
-def panel():
-    if not panel_auth(request): return "forbidden", 403
-    key = PANEL_KEY
-    html = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+
+LOGIN_PAGE = """<!doctype html><html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Панель бота</title>
 <style>
-body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#0b0e13;color:#e8ecf1;margin:0;padding:16px}
-h1{font-size:20px;margin:0 0 8px} .sub{color:#8a94a6;margin-bottom:16px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:16px}
-.card{background:#141a22;border:1px solid #222a36;border-radius:12px;padding:12px}
-.k{color:#8a94a6;font-size:12px} .v{font-size:22px;font-weight:700}
-table{width:100%%;border-collapse:collapse;font-size:13px} th,td{padding:8px;border-bottom:1px solid #222a36;text-align:left;vertical-align:top}
-th{color:#8a94a6;font-weight:600} .tag{display:inline-block;padding:2px 8px;border-radius:999px;background:#1c2430;font-size:12px}
-.ok{background:#16301a;color:#b6ff3e} .warn{background:#302616;color:#ff8a3d}
-a{color:#4cd7f0} .sec{margin-top:18px} h2{font-size:16px;margin:0 0 8px}
+:root{--bg:#0a0d12;--card:#141a23;--line:#232c39;--ink:#eef2f7;--dim:#8d98aa;--mint:#b6ff3e}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:grid;place-items:center;background:radial-gradient(120% 80% at 0% 0%,#16210f 0%,#0a0d12 55%);
+color:var(--ink);font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;padding:24px}
+.box{width:100%;max-width:380px;background:var(--card);border:1px solid var(--line);border-radius:20px;padding:24px}
+h1{font-size:20px;margin:0 0 6px}p{color:var(--dim);font-size:14px;margin:0 0 18px;line-height:1.5}
+input{width:100%;padding:14px;border-radius:12px;border:1px solid var(--line);background:#0d1218;color:var(--ink);
+font:600 18px/1 ui-monospace,Menlo,monospace;letter-spacing:6px;text-align:center;margin-bottom:12px}
+button{width:100%;padding:14px;border-radius:12px;border:0;background:var(--mint);color:#0b0f08;font-weight:800;font-size:15px}
+.err{color:#ff8a6a;font-size:13px;min-height:18px;margin-top:10px}
 </style></head><body>
-<h1>Панель бота — реальное время</h1>
-<div class="sub">Обновляется автоматически каждые 5 сек. <a href="/panel?key=%(key)s">Обновить</a> · <a href="/health">/health</a></div>
-<div id="app">Загрузка...</div>
+<form class="box" method="get">
+  <h1>Панель бота</h1>
+  <p>Введите код из бота: /panelcode. Код живёт 10 минут.</p>
+  <input name="code" inputmode="numeric" maxlength="6" placeholder="000000" autofocus>
+  <button>Войти</button>
+  <div class="err">__ERR__</div>
+</form></body></html>"""
+
+
+PANEL_PAGE = """<!doctype html><html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Панель бота</title>
+<style>
+:root{--bg:#0a0d12;--card:#121821;--card2:#0f151d;--line:#222b38;--ink:#eef2f7;--dim:#8d98aa;--mint:#b6ff3e;
+--cyan:#56d6f0;--amber:#ff9646;--green:#48e2a0}
+*{box-sizing:border-box}
+body{margin:0;background:#0a0d12;color:var(--ink);font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+padding:18px 14px 40px;max-width:760px;margin:0 auto}
+header{display:flex;align-items:center;gap:10px;margin-bottom:4px}
+.badge{font:800 11px/1 system-ui;letter-spacing:1.6px;color:var(--mint);background:#1a2612;border:1px solid #33491f;
+padding:7px 10px;border-radius:999px}
+h1{font-size:22px;margin:12px 0 4px}
+.sub{color:var(--dim);font-size:13px;margin-bottom:16px}
+.dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--green);margin-right:6px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:18px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:14px}
+.k{color:var(--dim);font-size:12px;margin-bottom:6px}
+.v{font-size:24px;font-weight:800;letter-spacing:-.4px}
+h2{font-size:15px;margin:22px 0 10px;letter-spacing:.2px}
+h2 span{color:var(--dim);font-weight:500;font-size:12px;margin-left:6px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:9px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--dim);font-weight:600;font-size:12px}
+tr:last-child td{border-bottom:0}
+.tag{display:inline-block;padding:3px 9px;border-radius:999px;background:#1b2431;font-size:11px;font-weight:700}
+.ok{background:#152a18;color:#a8ef9a}.warn{background:#2b2214;color:#ffbe7a}.bad{background:#2b1616;color:#ff9a8a}
+input.price,select,textarea,input.reply{background:#0d1218;border:1px solid var(--line);color:var(--ink);
+border-radius:9px;padding:7px 9px;font:inherit;font-size:13px;width:100%}
+textarea{resize:vertical;min-height:38px}
+button{background:var(--mint);color:#0b0f08;border:0;border-radius:10px;padding:8px 12px;font-weight:800;font-size:13px;cursor:pointer}
+button.ghost{background:#1b2431;color:var(--ink);border:1px solid var(--line)}
+button.mini{padding:6px 9px;font-size:12px}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.chart{display:flex;align-items:flex-end;gap:8px;height:120px;padding:8px 0}
+.bar{flex:1;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;gap:6px;height:100%}
+.bar i{display:block;width:100%;background:linear-gradient(180deg,var(--mint),#6f9a20);border-radius:6px 6px 3px 3px;min-height:3px}
+.bar b{font-size:10px;color:var(--dim);font-weight:500}
+a{color:var(--cyan)}
+.mut{color:var(--dim);font-size:12px}
+</style></head><body>
+<header><div class="badge">ПАНЕЛЬ</div><div class="mut" id="upd"></div></header>
+<h1>Бот под контролем</h1>
+<div class="sub"><span class="dot"></span><span id="status">онлайн</span> · <span id="storage">-</span> · <span id="slot">-</span></div>
+<div id="app"><div class="card">Загрузка…</div></div>
+
 <script>
-const key=%(keyj)s;
-async function load(){
- try{
-  const r=await fetch('/panel/data?key='+encodeURIComponent(key)); const d=await r.json();
-  const s=d.stats;
-  document.getElementById('app').innerHTML=`
-   <div class="grid">
-    <div class="card"><div class="k">Хранилище</div><div style="font-size:14px;font-weight:600">${d.storage}</div></div>
-    <div class="card"><div class="k">Статус</div><div style="font-size:14px;font-weight:600">${d.slot||'-'}</div></div>
+const KEY = "__KEY__";
+const esc = s => String(s==null?"":s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const tag = s => { const m={"готово":"ok","принят":"ok","в работе":"warn","новый":"warn"}; return `<span class="tag ${m[s]||""}">${esc(s)}</span>`; };
+
+async function act(payload){
+  const r = await fetch('/panel/action', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(Object.assign({key:KEY}, payload))});
+  const d = await r.json().catch(()=>({}));
+  if(!d.ok) alert(d.error||'Не получилось');
+  load();
+}
+
+function render(d){
+  document.getElementById('storage').textContent = d.storage;
+  document.getElementById('slot').textContent = d.slot || '-';
+  document.getElementById('upd').textContent = 'обновлено ' + new Date().toLocaleTimeString('ru-RU');
+  const s = d.stats;
+  const max = Math.max(1, ...d.chart.map(x=>x.messages));
+  document.getElementById('app').innerHTML = `
+  <div class="grid">
     <div class="card"><div class="k">Запуски</div><div class="v">${s.starts}</div></div>
     <div class="card"><div class="k">Сообщения</div><div class="v">${s.messages}</div></div>
     <div class="card"><div class="k">Обращения</div><div class="v">${s.leads}</div></div>
     <div class="card"><div class="k">Пользователи</div><div class="v">${s.users}</div></div>
-   </div>
-   <div class="sec"><h2>Услуги и цены</h2><table><tr><th>Услуга</th><th>Цена</th><th>Срок</th></tr>
-    ${d.services.map(x=>`<tr><td>${x.title}</td><td>${x.price}</td><td>${x.term}</td></tr>`).join('')}
-   </table></div>
-   <div class="sec"><h2>Последние заявки</h2><table><tr><th>#</th><th>Клиент</th><th>Тип</th><th>Статус</th><th>Текст</th></tr>
-    ${(d.tickets.length?d.tickets:[{id:'-',name:'нет',kind:'-',status:'-',text:'-'}]).map(t=>`<tr><td>${t.id}</td><td>${t.name||'-'} ${t.username?('@'+t.username):''}<br><span class="k">${t.chat_id||''}</span></td><td>${t.kind||''} ${t.service||''}</td><td><span class="tag ${(t.status=='готово'||t.status=='принят')?'ok':'warn'}">${t.status||'-'}</span></td><td>${(t.text||'').slice(0,140)}</td></tr>`).join('')}
-   </table></div>
-   <div class="sec"><h2>Отзывы</h2><table><tr><th>#</th><th>Автор</th><th>Статус</th><th>Текст</th></tr>
-    ${(d.reviews.length?d.reviews:[{id:'-',name:'нет',status:'-',text:'-'}]).map(r=>`<tr><td>${r.id}</td><td>${r.name||'-'}</td><td><span class="tag ${r.status=='approved'?'ok':'warn'}">${r.status}</span></td><td>${(r.text||'').slice(0,160)}</td></tr>`).join('')}
-   </table></div>
-   <div class="sec"><h2>Сегменты</h2><div class="k">${Object.keys(d.segments).length?Object.entries(d.segments).map(([k,v])=>`${k}: ${v}`).join(' · '):'нет данных'}</div></div>`;
- }catch(e){document.getElementById('app').innerHTML='<div class="card">Ошибка загрузки</div>';}
+  </div>
+
+  <h2>7 дней <span>сообщения</span></h2>
+  <div class="card"><div class="chart">
+    ${d.chart.length ? d.chart.map(x=>`<div class="bar"><b>${x.messages}</b><i style="height:${Math.round(x.messages/max*84)+6}%"></i><b>${esc(x.d)}</b></div>`).join('') : '<div class="mut">данных пока нет</div>'}
+  </div></div>
+
+  <h2>Услуги и цены <span>можно менять</span></h2>
+  <div class="card"><table><tr><th>Услуга</th><th>Срок</th><th>Цена</th><th></th></tr>
+    ${d.services.map(x=>`<tr>
+      <td><b>${esc(x.title)}</b><div class="mut">${esc(x.id)}</div></td>
+      <td class="mut">${esc(x.term)}</td>
+      <td style="min-width:110px"><input class="price" id="p_${esc(x.id)}" value="${esc(x.price)}"></td>
+      <td><button class="mini" onclick="act({a:'price',sid:'${esc(x.id)}',value:document.getElementById('p_${esc(x.id)}').value})">OK</button></td>
+    </tr>`).join('')}
+  </table></div>
+
+  <h2>Заявки <span>${s.tickets}</span></h2>
+  <div class="card"><table><tr><th>#</th><th>Клиент</th><th>Статус</th><th>Ответ</th></tr>
+    ${(d.tickets.length?d.tickets:[]).map(t=>`<tr>
+      <td>${esc(t.id)}</td>
+      <td><b>${esc(t.name||'-')}</b> ${t.username?('<a href="https://t.me/'+esc(t.username)+'" target="_blank">@'+esc(t.username)+'</a>'):''}
+        <div class="mut">${esc(t.kind||'')} ${esc(t.service||'')}</div>
+        <div class="mut">${esc((t.text||'').slice(0,120))}</div></td>
+      <td style="min-width:104px">
+        <select onchange="act({a:'status',id:'${esc(t.id)}',value:this.value})">
+          ${["новый","принят","в работе","готово"].map(x=>`<option ${x===t.status?'selected':''}>${x}</option>`).join('')}
+        </select></td>
+      <td style="min-width:150px">
+        <textarea class="reply" id="r_${esc(t.id)}" placeholder="текст клиенту"></textarea>
+        <button class="mini" style="margin-top:6px" onclick="act({a:'reply',chat:'${esc(t.chat_id)}',text:document.getElementById('r_${esc(t.id)}').value});this.closest('td').querySelector('textarea').value=''">Отправить</button>
+      </td></tr>`).join('') || '<tr><td colspan="4" class="mut">заявок нет</td></tr>'}
+  </table></div>
+
+  <h2>Отзывы <span>${s.reviews_ok}/${s.reviews_all}</span></h2>
+  <div class="card"><table>
+    ${(d.reviews.length?d.reviews:[]).map(r=>`<tr>
+      <td>${esc(r.id)}</td><td><b>${esc(r.name||'-')}</b><div class="mut">${esc((r.text||'').slice(0,110))}</div></td>
+      <td>${r.status==='approved'?'<span class="tag ok">опубликован</span>':'<span class="tag warn">на модерации</span>'}</td>
+      <td style="min-width:96px">${r.status==='approved'?'':`<button class="mini" onclick="act({a:'review',id:'${esc(r.id)}',value:'approved'})">Ок</button> <button class="mini ghost" onclick="act({a:'review',id:'${esc(r.id)}',value:'rejected'})">Нет</button>`}</td>
+    </tr>`).join('') || '<tr><td colspan="4" class="mut">отзывов нет</td></tr>'}
+  </table></div>
+
+  <h2>Админы <span>${d.admins.length}</span></h2>
+  <div class="card"><table>
+    ${d.admins.map(a=>`<tr><td><b>${esc(a.name)}</b>${a.root?' ★':''}<div class="mut">${esc(a.id)}</div></td>
+      <td>${esc(a.role)}</td><td class="mut">прав: ${a.perms}</td></tr>`).join('')}
+  </table><div class="mut" style="margin-top:8px">Менять роли: в боте → /admins</div></div>
+
+  <h2>Сегменты и промокоды</h2>
+  <div class="card">
+    <div class="mut">${Object.keys(d.segments).length?Object.entries(d.segments).map(([k,v])=>esc(k)+': '+v).join(' · '):'нет данных'}</div>
+    <div class="mut" style="margin-top:8px">${Object.keys(d.promos).length?Object.entries(d.promos).map(([k,v])=>esc(k.toUpperCase())+' −'+v+'%').join(' · '):'промокодов нет'}</div>
+  </div>`;
+}
+
+async function load(){
+  try{
+    const r = await fetch('/panel/data?key='+encodeURIComponent(KEY));
+    if(!r.ok) throw 0;
+    render(await r.json());
+  }catch(e){ document.getElementById('app').innerHTML = '<div class="card">Нет связи с ботом. Обновлю через 5 сек.</div>'; }
 }
 load(); setInterval(load, 5000);
-</script></body></html>""" % {"key": key, "keyj": json.dumps(key)}
-    return html
+</script></body></html>"""
+
+
+@app.route("/panel")
+def panel():
+    if not panel_auth(request):
+        code = request.args.get("code") or ""
+        err = "Неверный или просроченный код" if code else ""
+        return LOGIN_PAGE.replace("__ERR__", err), 200
+    html = PANEL_PAGE.replace("__KEY__", PANEL_KEY)
+    resp = app.make_response(html)
+    resp.set_cookie("panel_key", PANEL_KEY, max_age=60 * 60 * 24 * 30, httponly=True, samesite="Lax")
+    return resp
+
 
 @app.route("/panel/data")
 def panel_data():
-    if not panel_auth(request): return jsonify(error="forbidden"), 403
+    if not panel_auth(request):
+        return jsonify(error="forbidden"), 403
     return jsonify(panel_snapshot())
+
+
+@app.route("/panel/action", methods=["POST"])
+def panel_action():
+    body = request.get_json(force=True, silent=True) or {}
+    key = body.get("key") or request.args.get("key") or request.cookies.get("panel_key")
+    if key != PANEL_KEY:
+        return jsonify(ok=False, error="forbidden"), 403
+    a = body.get("a")
+    if a == "price":
+        sid = body.get("sid", "")
+        if svc(sid).get("id") == sid:
+            old = (SETTINGS.get("services", {}).get(sid) or {}).get("price", "-")
+            SETTINGS.setdefault("services", {}).setdefault(sid, {})["price"] = body.get("value", "")
+            save_settings(SETTINGS)
+            globals()["SERVICES"] = get_services()
+            notify_change("панель", "Цена изменена", "%s: %s → %s" % (sid, old, body.get("value", "")))
+            return jsonify(ok=True)
+        return jsonify(ok=False, error="нет такой услуги")
+    if a == "reply":
+        chat = body.get("chat", "")
+        text = (body.get("text") or "").strip()
+        if not chat or not text:
+            return jsonify(ok=False, error="пусто")
+        send(chat, "<b>Ответ от продавца</b>\n\n%s" % text,
+             keyboard=[[{"text": "Ответить в боте", "callback_data": "ask"}]])
+        notify_change("панель", "Ответ клиенту", "Кому: %s\n%s" % (chat, text[:200]))
+        return jsonify(ok=True)
+    if a == "status":
+        t = set_ticket_status(body.get("id"), body.get("value"))
+        if t:
+            send(t["chat_id"], "<b>Статус заявки #%s:</b> %s" % (t["id"], t["status"]),
+                 keyboard=[[{"text": "Написать в боте", "callback_data": "ask"}]])
+            notify_change("панель", "Статус заявки", "#%s → %s" % (t["id"], t["status"]))
+            return jsonify(ok=True)
+        return jsonify(ok=False, error="нет заявки")
+    if a == "review":
+        for r in DATA.get("reviews", []):
+            if str(r.get("id")) == str(body.get("id")):
+                r["status"] = body.get("value")
+                save_data(DATA)
+                return jsonify(ok=True)
+        return jsonify(ok=False, error="нет отзыва")
+    return jsonify(ok=False, error="unknown action")
+
+# ============================================================================
+#  РАСШИРЕНИЕ v3: админы/права, шаблоны, примеры, баны, промо, оплата, панель
+# ============================================================================
+
+DEFAULT_TEMPLATES = [
+    "Уточню пару деталей и отвечу.",
+    "Могу взять эту задачу. Напишите, пожалуйста, подробности.",
+    "По срокам ориентировочно 1–2 дня.",
+    "Пришлите, пожалуйста, пример или подробнее опишите задачу.",
+]
+
+
+def templates():
+    t = SETTINGS.get("templates")
+    if not isinstance(t, list) or not t:
+        t = list(DEFAULT_TEMPLATES)
+    return t[:8]
+
+
+def price_num(s):
+    d = re.sub(r"[^\d]", "", str(s or ""))
+    return int(d) if d else 0
+
+
+def fmt_money(n):
+    return "{:,}".format(int(n)).replace(",", " ") + " ₽"
+
+
+def today():
+    return time.strftime("%Y-%m-%d")
+
+
+def daily_bump(key, n=1):
+    try:
+        d = DATA.setdefault("daily", {}).setdefault(today(), {})
+        d[key] = int(d.get(key, 0)) + n
+    except Exception:
+        pass
+
+
+def send_photo_id(chat_id, caption, keyboard=None, file_id=""):
+    payload = {"chat_id": chat_id, "caption": premium(caption), "parse_mode": "HTML", "photo": file_id}
+    if keyboard:
+        payload["reply_markup"] = {"inline_keyboard": keyboard}
+    res = api("sendPhoto", **payload)
+    if not res.get("ok"):
+        print("photo_id failed:", res.get("description"))
+    return res
+
+
+def send_document(chat_id, path, caption=""):
+    try:
+        with open(path, "rb") as f:
+            return requests.post(
+                BASE + "/sendDocument",
+                data={"chat_id": chat_id, "caption": caption},
+                files={"document": (os.path.basename(path), f)},
+                timeout=120,
+            ).json()
+    except Exception as e:
+        print("doc error:", e)
+        return {}
+
+
+# ---------------------------------------------------------------- админы ----
+def admin_home(chat_id):
+    rows = []
+    for cid, v in staff_map().items():
+        rows.append([{"text": "%s · %s" % (admin_name(cid), role_title(v.get("role"))),
+                      "callback_data": "admx:card:%s" % cid}])
+    rows.append([{"text": "Добавить админа", "callback_data": "admx:add"}])
+    rows.append([{"text": "Назад", "callback_data": "adm:back"}])
+    send(chat_id, admins_text() + "\n\nНажмите на админа — роль и права.", keyboard=rows)
+
+
+def admin_card(chat_id, cid):
+    v = staff_map().get(cid) or {}
+    p = perms_of(cid)
+    role = v.get("role")
+    lines = ["<b>%s</b>" % admin_name(cid), "<code>%s</code>" % cid, "Роль: <b>%s</b>" % role_title(role),
+             "<i>%s</i>" % ROLE_DEFS.get(role, {}).get("hint", ""), ""]
+    if v.get("root"):
+        lines.append("★ создатель — роль и удаление заблокированы")
+    lines.append("Права: " + (", ".join(PERM_TITLES[x] for x in sorted(p)) if p else "нет"))
+    rows = []
+    buf = []
+    for r in ("owner", "admin", "manager", "support", "viewer"):
+        buf.append({"text": ("• " if r == role else "") + role_title(r), "callback_data": "admx:role:%s:%s" % (cid, r)})
+        if len(buf) == 2:
+            rows.append(buf); buf = []
+    if buf:
+        rows.append(buf)
+    buf = []
+    for k in PERM_TITLES:
+        buf.append({"text": ("✓ " if k in p else "✕ ") + PERM_TITLES[k], "callback_data": "admx:perm:%s:%s" % (cid, k)})
+        if len(buf) == 2:
+            rows.append(buf); buf = []
+    if buf:
+        rows.append(buf)
+    rows.append([{"text": "Удалить админа", "callback_data": "admx:del:%s" % cid},
+                 {"text": "Назад", "callback_data": "admx:home"}])
+    send(chat_id, "\n".join(lines), keyboard=rows)
+
+
+def role_picker(chat_id, cid):
+    rows = []
+    buf = []
+    for r in ("owner", "admin", "manager", "support", "viewer"):
+        buf.append({"text": role_title(r), "callback_data": "admx:role:%s:%s" % (cid, r)})
+        if len(buf) == 2:
+            rows.append(buf); buf = []
+    if buf:
+        rows.append(buf)
+    rows.append([{"text": "Отмена", "callback_data": "admx:home"}])
+    send(chat_id, "<b>Роль для</b> <code>%s</code>\n\n%s" % (
+        cid, "\n".join("• %s — %s" % (role_title(r), d["hint"]) for r, d in ROLE_DEFS.items())), keyboard=rows)
+
+
+# ------------------------------------------------------------- для клиента ----
+def my_orders(chat_id):
+    ts = [t for t in DATA.get("tickets", []) if str(t.get("chat_id")) == str(chat_id)]
+    if not ts:
+        return send(chat_id, "У вас пока нет заявок.\n\nОформить можно в «Отзывы / FAQ» → «Оформить заявку».",
+                    [[{"text": "Оформить заявку", "callback_data": "brief:start"}], [{"text": "В меню", "callback_data": "menu"}]])
+    icons = {"новый": "○", "принят": "◔", "в работе": "◑", "готово": "●"}
+    lines = ["<b>Мои заявки</b>\n"]
+    for t in ts[-10:]:
+        lines.append("%s <b>#%s</b> — %s\n%s" % (icons.get(t.get("status"), "○"), t["id"], t.get("status"),
+                                                (t.get("text") or "")[:120]))
+        lines.append("")
+    send(chat_id, "\n".join(lines), [[{"text": "Написать в боте", "callback_data": "ask"}], [{"text": "В меню", "callback_data": "menu"}]])
+
+
+def my_ref(chat_id):
+    u = bot_username()
+    link = "https://t.me/%s?start=ref_%s" % (u, chat_id)
+    refs = DATA.get("refs") or {}
+    cnt = len([1 for v in refs.values() if str(v) == str(chat_id)])
+    send(chat_id, "<b>Моя ссылка</b>\n\n%s\n\nПришло по ней: <b>%s</b>\n\nСкажите свой код продавцу — будет скидка." % (link, cnt),
+         [[{"text": "Каталог", "callback_data": "catalog"}], [{"text": "В меню", "callback_data": "menu"}]])
+
+
+def apply_promo(chat_id, code):
+    promos = SETTINGS.get("promos") or {}
+    code = (code or "").strip().lower()
+    if code not in promos:
+        return send(chat_id, "Такого промокода нет. Проверьте написание.")
+    pct = promos[code]
+    DATA.setdefault("promo", {})[str(chat_id)] = {"code": code, "percent": pct}
+    save_data(DATA)
+    return send(chat_id, "Промокод <b>%s</b> принят: −%s%%.\n\nУчтём при расчёте заказа." % (code.upper(), pct))
+
+
+def calc_menu(chat_id):
+    rows = []
+    for s in get_services():
+        rows.append([{"text": "%s · %s" % (s["title"], s["price"]), "callback_data": "calc:%s" % s["id"]}])
+    rows.append([{"text": "В меню", "callback_data": "menu"}])
+    send(chat_id, "<b>Калькулятор</b>\n\nЧто нужно сделать? Покажу цену и вариант со срочностью.", keyboard=rows)
+
+
+def calc_result(chat_id, sid, urgent):
+    s = svc(sid)
+    base = price_num(s.get("price"))
+    promo = (DATA.get("promo") or {}).get(str(chat_id))
+    total = base
+    lines = ["<b>%s</b>" % s["title"], "", "Базовая цена: <b>%s</b>" % fmt_money(base)]
+    if urgent:
+        total = int(round(base * 1.3))
+        lines.append("Срочно (+30%%): <b>%s</b>" % fmt_money(total))
+    if promo:
+        disc = int(round(total * promo["percent"] / 100.0))
+        total -= disc
+        lines.append("Промокод %s (−%s%%): <b>−%s</b>" % (promo["code"].upper(), promo["percent"], fmt_money(disc)))
+    lines.append("")
+    lines.append("Итого: <b>%s</b> · срок %s" % (fmt_money(total), s.get("term", "-")))
+    lines.append("")
+    lines.append("Точную цену скажу после короткого описания задачи.")
+    kb = [[{"text": "Обсудить", "callback_data": "ask"}],
+          [{"text": "Срочно / не срочно", "callback_data": "calc2:%s:%s" % (sid, 0 if urgent else 1)}],
+          [{"text": "Другая услуга", "callback_data": "calc"}],
+          [{"text": "В меню", "callback_data": "menu"}]]
+    send(chat_id, "\n".join(lines), kb)
+
+
+def show_example_more(chat_id):
+    exs = [e for e in (DATA.get("examples") or []) if e.get("file_id")]
+    if not exs:
+        return send(chat_id, "Свежих работ пока нет — смотрите раздел «Примеры работ».",
+                    [[{"text": "Примеры", "callback_data": "examples"}], [{"text": "В меню", "callback_data": "menu"}]])
+    for e in exs[-5:]:
+        caption = "<b>%s</b>" % (e.get("title") or "Работа")
+        send_photo_id(chat_id, caption,
+                      [[{"text": "Хочу так же", "callback_data": "exwant:%s" % e["id"]}],
+                       [{"text": "В меню", "callback_data": "menu"}]], e["file_id"])
+
+
+def want_like_this(chat_id, user, eid):
+    e = None
+    for x in DATA.get("examples") or []:
+        if str(x.get("id")) == str(eid):
+            e = x
+            break
+    if not e:
+        return send(chat_id, "Работа не найдена.")
+    t = add_ticket(chat_id, user, "пример", "Хочу так же: %s" % (e.get("title") or "работа"), service=e.get("kind", ""))
+    bump_stat("leads"); daily_bump("leads")
+    kb = [reply_kb(chat_id)[0],
+          [{"text": "Принят", "callback_data": "tstat:%s:принят" % t["id"]},
+           {"text": "В работе", "callback_data": "tstat:%s:в работе" % t["id"]},
+           {"text": "Готово", "callback_data": "tstat:%s:готово" % t["id"]}]]
+    for aid in staff_ids():
+        send(aid, "<b>ЗАЯВКА #%s (пример)</b>\n\n%s (@%s)\n<code>%s</code>\n\nХочет так же: <b>%s</b>" % (
+            t["id"], user.get("first_name", "-"), user.get("username", "-"), chat_id, e.get("title") or "-"), keyboard=kb)
+    send(chat_id, "Заявка #%s создана. Напишу здесь, в боте." % t["id"],
+         [[{"text": "Написать в боте", "callback_data": "ask"}], [{"text": "В меню", "callback_data": "menu"}]])
+
+
+# --------------------------------------------------------------- команды ----
+def extra_admin(text, chat_id, user):
+    who = user.get("username") or user.get("first_name") or str(chat_id)
+    t = text.strip()
+
+    if t == "/myrights":
+        p = perms_of(chat_id)
+        v = staff_map().get(str(chat_id)) or {}
+        send(chat_id, "<b>Ваши права</b>\n\nРоль: <b>%s</b>\nПрава: %s" % (
+            role_title(v.get("role")), ", ".join(PERM_TITLES[x] for x in sorted(p)) or "нет"))
+        return True
+
+    if t == "/admins":
+        if not (can(chat_id, "admins") or can(chat_id, "admins_view")):
+            send(chat_id, denied_text()); return True
+        admin_home(chat_id)
+        return True
+
+    if t.startswith("/admin_add "):
+        if not can(chat_id, "admins"):
+            send(chat_id, denied_text()); return True
+        p = t.split()
+        if len(p) < 3:
+            state[chat_id] = {"step": "admin_add"}
+            send(chat_id, "Пришлите <code>chat_id</code> нового админа или перешлите любое его сообщение боту.")
+            return True
+        cid, role = p[1], p[2]
+        ok, msg = set_admin(cid, role)
+        if ok:
+            notify_change(who, "Добавлен администратор", "%s — %s" % (cid, role_title(role)))
+            send(cid, "<b>Вам выдали доступ к боту</b>\n\nРоль: %s\nПрава: /myrights\nКоманды: /help_admin" % role_title(role))
+        send(chat_id, msg)
+        return True
+
+    if t.startswith("/admin_role "):
+        if not can(chat_id, "admins"):
+            send(chat_id, denied_text()); return True
+        p = t.split()
+        if len(p) < 3:
+            send(chat_id, "Формат: /admin_role CHAT_ID роль\nРоли: " + ", ".join(ROLE_DEFS.keys())); return True
+        ok, msg = set_admin(p[1], p[2])
+        if ok:
+            notify_change(who, "Роль изменена", msg)
+            send(p[1], "Ваша роль: <b>%s</b>\nПрава: /myrights" % role_title(p[2]))
+        send(chat_id, msg)
+        return True
+
+    if t.startswith("/admin_del "):
+        if not can(chat_id, "admins"):
+            send(chat_id, denied_text()); return True
+        ok, msg = drop_admin(t.split(None, 1)[1].strip())
+        if ok:
+            notify_change(who, "Админ удалён", msg)
+        send(chat_id, msg)
+        return True
+
+    if t.startswith("/admin_perm "):
+        if not can(chat_id, "admins"):
+            send(chat_id, denied_text()); return True
+        p = t.split()
+        if len(p) < 4:
+            send(chat_id, "Формат: /admin_perm CHAT_ID право on|off\nПрава: " + ", ".join(PERM_TITLES.keys())); return True
+        ok, msg = toggle_perm(p[1], p[2], p[3].lower() in ("on", "1", "да", "yes", "вкл"))
+        if ok:
+            notify_change(who, "Права изменены", msg)
+        send(chat_id, msg)
+        return True
+
+    if t == "/admin_info":
+        return send(chat_id, admins_text()) or True
+
+    if t == "/templates":
+        lst = templates()
+        send(chat_id, "<b>Шаблоны быстрых ответов</b>\n\n" + "\n".join("%s. %s" % (i + 1, x) for i, x in enumerate(lst)) +
+             "\n\n/tpl_add текст — добавить\n/tpl_del N — удалить")
+        return True
+    if t.startswith("/tpl_add "):
+        if not can(chat_id, "settings"):
+            send(chat_id, denied_text()); return True
+        SETTINGS.setdefault("templates", templates()).append(t.split(None, 1)[1]); save_settings(SETTINGS)
+        notify_change(who, "Шаблон добавлен", t.split(None, 1)[1][:200])
+        return send(chat_id, "Добавлено. Всего: %s" % len(templates())) or True
+    if t.startswith("/tpl_del "):
+        if not can(chat_id, "settings"):
+            send(chat_id, denied_text()); return True
+        try:
+            n = int(t.split()[1]) - 1
+            lst = list(templates())
+            if 0 <= n < len(lst):
+                rem = lst.pop(n)
+                SETTINGS["templates"] = lst; save_settings(SETTINGS)
+                notify_change(who, "Шаблон удалён", rem[:200])
+                return send(chat_id, "Удалено: %s" % rem) or True
+        except Exception:
+            pass
+        return send(chat_id, "Формат: /tpl_del N") or True
+
+    for pref, key, label in (("/set_title ", "title", "Название"), ("/set_desc ", "desc", "Описание"),
+                             ("/set_term ", "term", "Срок")):
+        if t.startswith(pref):
+            if not can(chat_id, "settings"):
+                send(chat_id, denied_text()); return True
+            p = t.split(None, 2)
+            if len(p) < 3:
+                return send(chat_id, "Формат: %s ID текст" % pref.strip()) or True
+            sid = p[1]
+            if svc(sid).get("id") != sid:
+                return send(chat_id, "Нет такой услуги: %s" % sid) or True
+            SETTINGS.setdefault("services", {}).setdefault(sid, {})[key] = p[2]
+            save_settings(SETTINGS)
+            globals()["SERVICES"] = get_services()
+            notify_change(who, "%s услуги изменено" % label, "%s: %s" % (sid, p[2][:300]))
+            return send(chat_id, "Ок: %s → %s" % (sid, p[2][:200])) or True
+
+    if t.startswith("/addexample"):
+        if not can(chat_id, "settings"):
+            send(chat_id, denied_text()); return True
+        kind = t.split()[1] if len(t.split()) > 1 else "bots"
+        state[chat_id] = {"step": "exphoto:%s" % kind}
+        return send(chat_id, "Пришлите фото работы (подпись станет названием).\n\nОтмена: /cancel") or True
+    if t == "/examples_list":
+        exs = DATA.get("examples") or []
+        if not exs:
+            return send(chat_id, "Добавленных работ нет. /addexample bots") or True
+        return send(chat_id, "\n".join("#%s [%s] %s" % (e["id"], e.get("kind"), e.get("title")) for e in exs[-20:])) or True
+    if t.startswith("/delexample "):
+        if not can(chat_id, "settings"):
+            send(chat_id, denied_text()); return True
+        eid = t.split()[1]
+        before = len(DATA.get("examples") or [])
+        DATA["examples"] = [e for e in (DATA.get("examples") or []) if str(e.get("id")) != str(eid)]
+        save_data(DATA)
+        return send(chat_id, "Удалено: %s" % (before - len(DATA["examples"]))) or True
+
+    if t.startswith("/ban "):
+        if not can(chat_id, "ban"):
+            send(chat_id, denied_text()); return True
+        p = t.split(None, 2)
+        cid = p[1]
+        reason = p[2] if len(p) > 2 else "без причины"
+        DATA.setdefault("banned", {})[str(cid)] = {"reason": reason, "by": who, "ts": int(time.time())}
+        save_data(DATA)
+        notify_change(who, "Пользователь заблокирован", "%s\n%s" % (cid, reason))
+        return send(chat_id, "Заблокирован: %s" % cid) or True
+    if t.startswith("/unban "):
+        if not can(chat_id, "ban"):
+            send(chat_id, denied_text()); return True
+        cid = t.split()[1]
+        (DATA.get("banned") or {}).pop(str(cid), None)
+        save_data(DATA)
+        return send(chat_id, "Разблокирован: %s" % cid) or True
+    if t == "/bans":
+        b = DATA.get("banned") or {}
+        if not b:
+            return send(chat_id, "Заблокированных нет.") or True
+        return send(chat_id, "<b>Баны</b>\n\n" + "\n".join("• %s — %s" % (k, v.get("reason")) for k, v in b.items())) or True
+    if t == "/antispam":
+        a = SETTINGS.get("antispam") or {}
+        return send(chat_id, "Антиспам\n\nПауза между сообщениями: %s сек\nСменить: /antispam_set 1" % a.get("seconds", 0.7)) or True
+    if t.startswith("/antispam_set "):
+        if not can(chat_id, "ban"):
+            send(chat_id, denied_text()); return True
+        try:
+            v = float(t.split()[1].replace(",", "."))
+        except Exception:
+            return send(chat_id, "Формат: /antispam_set 1.5") or True
+        SETTINGS.setdefault("antispam", {})["seconds"] = v
+        save_settings(SETTINGS)
+        return send(chat_id, "Пауза: %s сек" % v) or True
+
+    if t == "/promos":
+        p = SETTINGS.get("promos") or {}
+        return send(chat_id, "<b>Промокоды</b>\n\n" + ("\n".join("• %s — −%s%%" % (k.upper(), v) for k, v in p.items()) or "нет") +
+                    "\n\n/promo_add КОД 10 · /promo_del КОД") or True
+    if t.startswith("/promo_add "):
+        if not can(chat_id, "settings"):
+            send(chat_id, denied_text()); return True
+        p = t.split()
+        if len(p) < 3:
+            return send(chat_id, "Формат: /promo_add КОД 10") or True
+        code = p[1].lower()
+        try:
+            pct = int(p[2])
+        except Exception:
+            pct = 10
+        SETTINGS.setdefault("promos", {})[code] = pct
+        save_settings(SETTINGS)
+        notify_change(who, "Промокод добавлен", "%s — −%s%%" % (code.upper(), pct))
+        return send(chat_id, "Промокод %s: −%s%%" % (code.upper(), pct)) or True
+    if t.startswith("/promo_del "):
+        if not can(chat_id, "settings"):
+            send(chat_id, denied_text()); return True
+        code = t.split()[1].lower()
+        (SETTINGS.get("promos") or {}).pop(code, None)
+        save_settings(SETTINGS)
+        return send(chat_id, "Удалён: %s" % code.upper()) or True
+
+    if t in ("/stats7", "/week"):
+        days = sorted((DATA.get("daily") or {}).keys())[-7:]
+        if not days:
+            return send(chat_id, "Данных пока нет.") or True
+        lines = ["<b>Последние 7 дней</b>"]
+        for d in days:
+            v = DATA["daily"][d]
+            lines.append("%s · запуски %s · сообщения %s · заявки %s" % (
+                d[5:], v.get("starts", 0), v.get("messages", 0), v.get("leads", 0)))
+        return send(chat_id, "\n".join(lines)) or True
+
+    if t == "/refstats":
+        refs = DATA.get("refs") or {}
+        cnt = {}
+        for v in refs.values():
+            cnt[str(v)] = cnt.get(str(v), 0) + 1
+        top = sorted(cnt.items(), key=lambda x: -x[1])[:10]
+        return send(chat_id, "<b>Приглашения</b>\n\n" + ("\n".join("%s — %s" % (USERS.get(k, k), v) for k, v in top) or "нет")) or True
+
+    if t.startswith("/pay "):
+        if not can(chat_id, "pay"):
+            send(chat_id, denied_text()); return True
+        p = t.split(None, 3)
+        if len(p) < 3:
+            return send(chat_id, "Формат: /pay CHAT_ID сумма описание\nСумма в Stars (1 ≈ 1.6 ₽)") or True
+        cid = p[1]
+        amount = int(price_num(p[2]) or 0)
+        desc = p[3] if len(p) > 3 else "Предоплата за работу"
+        r = api("sendInvoice", chat_id=cid, title="Оплата заказа", description=desc,
+                payload="pay-%s-%s" % (cid, int(time.time())), provider_token="", currency="XTR",
+                prices=[{"label": desc[:40], "amount": amount}])
+        return send(chat_id, "Счёт отправлен: %s" % (r.get("ok"))) or True
+
+    if t == "/csv":
+        if not can(chat_id, "export"):
+            send(chat_id, denied_text()); return True
+        import csv as _csv
+        path = os.path.join(HERE, "tickets.csv")
+        with open(path, "w", encoding="utf-8-sig", newline="") as f:
+            w = _csv.writer(f, delimiter=";")
+            w.writerow(["id", "дата", "статус", "chat_id", "имя", "username", "тип", "услуга", "текст"])
+            for x in DATA.get("tickets", []):
+                w.writerow([x.get("id"), time.strftime("%Y-%m-%d %H:%M", time.localtime(x.get("ts", 0))),
+                            x.get("status"), x.get("chat_id"), x.get("name"), x.get("username"),
+                            x.get("kind"), x.get("service"), (x.get("text") or "").replace("\n", " ")])
+        send_document(chat_id, path, "Заявки: %s" % len(DATA.get("tickets", [])))
+        return True
+
+    if t in ("/panelcode", "/panel_code"):
+        return send(chat_id, panel_code_message(chat_id)) or True
+
+    if t == "/reminders":
+        return send(chat_id, "Напоминания включены:\n• «в работе» > 2 дней → пинг админам\n• «готово» > 3 дней → просьба об отзыве клиенту") or True
+
+    return False
+
+
+def extra_state(msg, chat_id, user, st):
+    text = (msg.get("text") or "").strip()
+    step = str(st.get("step") or "")
+    who = user.get("username") or user.get("first_name") or str(chat_id)
+
+    if step in ("admin_add", "tpl_add", "ban_add", "promo_add") or step.startswith("exphoto:") or step.startswith("sstate:"):
+        if text.lower() in ("отмена", "cancel", "/cancel"):
+            state.pop(chat_id, None)
+            send(chat_id, "Отменено.")
+            return True
+
+    if step == "admin_add":
+        cid = None
+        fwd = msg.get("forward_from") or (msg.get("forward_origin") or {}).get("sender_user")
+        if fwd:
+            cid = fwd.get("id")
+        elif text.isdigit():
+            cid = text
+        if not cid:
+            send(chat_id, "Не понял. Пришлите chat_id (число) или перешлите сообщение человека.")
+            return True
+        state.pop(chat_id, None)
+        role_picker(chat_id, cid)
+        return True
+
+    if step == "tpl_add":
+        SETTINGS.setdefault("templates", templates()).append(text)
+        save_settings(SETTINGS)
+        state.pop(chat_id, None)
+        notify_change(who, "Шаблон добавлен", text[:200])
+        send(chat_id, "Добавлено: %s" % text)
+        return True
+
+    if step.startswith("exphoto:"):
+        kind = step.split(":", 1)[1]
+        file_id = ""
+        if msg.get("photo"):
+            file_id = msg["photo"][-1]["file_id"]
+        elif msg.get("document"):
+            file_id = msg.get("document", {}).get("file_id", "")
+        if not file_id:
+            send(chat_id, "Нужно именно фото. Пришлите картинку.")
+            return True
+        title = (msg.get("caption") or "").strip() or "Работа"
+        e = {"id": next_id(), "kind": kind, "title": title, "note": "", "file_id": file_id,
+             "ts": int(time.time()), "by": who}
+        DATA.setdefault("examples", []).append(e)
+        DATA["examples"] = DATA["examples"][-50:]
+        save_data(DATA)
+        state.pop(chat_id, None)
+        notify_change(who, "Пример добавлен", "%s: %s" % (kind, title))
+        send_photo_id(chat_id, "Добавлено: <b>%s</b>" % title,
+                      [[{"text": "В меню", "callback_data": "menu"}]], file_id)
+        return True
+
+    if step == "promo_add":
+        p = text.split()
+        if len(p) >= 2 and p[1].isdigit():
+            SETTINGS.setdefault("promos", {})[p[0].lower()] = int(p[1])
+            save_settings(SETTINGS)
+            state.pop(chat_id, None)
+            notify_change(who, "Промокод добавлен", "%s — −%s%%" % (p[0].upper(), p[1]))
+            send(chat_id, "Промокод %s: −%s%%" % (p[0].upper(), p[1]))
+            return True
+
+    if step.startswith("sstate:"):
+        sid, key = step.split(":")[1:3]
+        SETTINGS.setdefault("services", {}).setdefault(sid, {})[key] = text
+        save_settings(SETTINGS)
+        globals()["SERVICES"] = get_services()
+        state.pop(chat_id, None)
+        notify_change(who, "Услуга изменена", "%s · %s: %s" % (sid, key, text[:200]))
+        send(chat_id, "Ок: %s — %s" % (sid, text[:120]))
+        return True
+
+    if step == "ban_add":
+        p = text.split(None, 1)
+        if p and p[0].isdigit():
+            DATA.setdefault("banned", {})[p[0]] = {"reason": p[1] if len(p) > 1 else "без причины",
+                                                   "by": who, "ts": int(time.time())}
+            save_data(DATA)
+            state.pop(chat_id, None)
+            notify_change(who, "Пользователь заблокирован", p[0])
+            send(chat_id, "Заблокирован: %s" % p[0])
+            return True
+
+    return False
+
+
+def extra_client(text, chat_id, user):
+    t = text.strip()
+    if t == "/myorders":
+        my_orders(chat_id); return True
+    if t == "/myref":
+        my_ref(chat_id); return True
+    if t.startswith("/promo "):
+        apply_promo(chat_id, t.split(None, 1)[1]); return True
+    if t == "/promo":
+        return send(chat_id, "Напишите: /promo КОД") or True
+    if t == "/calc":
+        calc_menu(chat_id); return True
+    return False
+
+
+def extra_cb(data, chat_id, user):
+    who = user.get("username") or user.get("first_name") or str(chat_id)
+
+    if data == "admx:home":
+        if not (can(chat_id, "admins") or can(chat_id, "admins_view")):
+            return send(chat_id, denied_text()) or True
+        admin_home(chat_id); return True
+    if data == "admx:add":
+        if not can(chat_id, "admins"):
+            send(chat_id, denied_text()); return True
+        state[chat_id] = {"step": "admin_add"}
+        send(chat_id, "Пришлите <code>chat_id</code> или перешлите сообщение человека, которого надо добавить.")
+        return True
+    if data == "admx:none":
+        return True
+    if data.startswith("admx:card:"):
+        if not (can(chat_id, "admins") or can(chat_id, "admins_view")):
+            send(chat_id, denied_text()); return True
+        admin_card(chat_id, data.split(":")[2]); return True
+    if data.startswith("admx:role:"):
+        if not can(chat_id, "admins"):
+            send(chat_id, denied_text()); return True
+        _, _, cid, role = data.split(":")
+        ok, msg = set_admin(cid, role)
+        if ok:
+            notify_change(who, "Роль изменена", msg)
+            send(cid, "Ваша роль: <b>%s</b>\nПрава: /myrights" % role_title(role))
+        send(chat_id, msg)
+        admin_card(chat_id, cid)
+        return True
+    if data.startswith("admx:perm:"):
+        if not can(chat_id, "admins"):
+            send(chat_id, denied_text()); return True
+        _, _, cid, perm = data.split(":")
+        cur = perm in perms_of(cid)
+        ok, msg = toggle_perm(cid, perm, not cur)
+        if ok:
+            notify_change(who, "Права изменены", msg)
+        admin_card(chat_id, cid)
+        return True
+    if data.startswith("admx:del:"):
+        if not can(chat_id, "admins"):
+            send(chat_id, denied_text()); return True
+        cid = data.split(":")[2]
+        ok, msg = drop_admin(cid)
+        if ok:
+            notify_change(who, "Админ удалён", msg)
+        send(chat_id, msg)
+        admin_home(chat_id)
+        return True
+
+    if data == "calc":
+        calc_menu(chat_id); return True
+    if data.startswith("calc2:"):
+        _, sid, u = data.split(":")
+        calc_result(chat_id, sid, u == "1"); return True
+    if data.startswith("calc:"):
+        calc_result(chat_id, data.split(":", 1)[1], False); return True
+    if data == "ex_more":
+        show_example_more(chat_id); return True
+    if data.startswith("exwant:"):
+        want_like_this(chat_id, user, data.split(":", 1)[1]); return True
+    if data == "myorders":
+        my_orders(chat_id); return True
+    if data == "myref":
+        my_ref(chat_id); return True
+
+    if data == "adm:admins":
+        if not (can(chat_id, "admins") or can(chat_id, "admins_view")):
+            return send(chat_id, denied_text()) or True
+        admin_home(chat_id); return True
+    if data == "adm:more":
+        send(chat_id, "<b>Ещё</b>", [[{"text": "Тексты услуг", "callback_data": "adm:services"},
+                                     {"text": "Примеры работ", "callback_data": "adm:ex"}],
+                                    [{"text": "Шаблоны ответов", "callback_data": "adm:tpl"},
+                                     {"text": "Промокоды", "callback_data": "adm:promo"}],
+                                    [{"text": "Баны", "callback_data": "adm:bans"},
+                                     {"text": "Назад", "callback_data": "adm:back"}]])
+        return True
+    if data == "adm:services":
+        rows = [[{"text": s["title"], "callback_data": "adm:svc:%s" % s["id"]}] for s in get_services()]
+        rows.append([{"text": "Назад", "callback_data": "adm:more"}])
+        send(chat_id, "<b>Тексты услуг</b>\n\nВыберите услугу.", keyboard=rows); return True
+    if data.startswith("adm:svc:"):
+        sid = data.split(":", 2)[2]
+        s = svc(sid)
+        send(chat_id, "<b>%s</b>\n\nЦена: %s\nСрок: %s\n\n%s" % (s["title"], s["price"], s["term"], s["desc"]),
+             [[{"text": "Изменить название", "callback_data": "adm:setf:%s:title" % sid}],
+              [{"text": "Изменить описание", "callback_data": "adm:setf:%s:desc" % sid}],
+              [{"text": "Изменить срок", "callback_data": "adm:setf:%s:term" % sid}],
+              [{"text": "Изменить цену", "callback_data": "adm:setp:%s" % sid}],
+              [{"text": "Назад", "callback_data": "adm:services"}]])
+        return True
+    if data.startswith("adm:setf:"):
+        _, _, sid, key = data.split(":")
+        state[chat_id] = {"step": "sstate:%s:%s" % (sid, key)}
+        send(chat_id, "Пришлите новое значение для <b>%s</b> (%s) или «отмена»." % (sid, key)); return True
+    if data == "adm:tpl":
+        lst = templates()
+        rows = [[{"text": "%s. %s" % (i + 1, x[:28]), "callback_data": "adm:tpldel:%s" % (i + 1)}] for i, x in enumerate(lst)]
+        rows.append([{"text": "Добавить шаблон", "callback_data": "adm:tpladd"}])
+        rows.append([{"text": "Назад", "callback_data": "adm:more"}])
+        send(chat_id, "<b>Шаблоны</b>\n\nНажмите, чтобы удалить, или добавьте новый.", keyboard=rows); return True
+    if data == "adm:tpladd":
+        state[chat_id] = {"step": "tpl_add"}
+        send(chat_id, "Пришлите текст нового шаблона."); return True
+    if data.startswith("adm:tpldel:"):
+        try:
+            n = int(data.split(":")[2]) - 1
+            lst = list(templates()); rem = lst.pop(n)
+            SETTINGS["templates"] = lst; save_settings(SETTINGS)
+            notify_change(who, "Шаблон удалён", rem[:200])
+        except Exception:
+            pass
+        return True
+    if data == "adm:promo":
+        p = SETTINGS.get("promos") or {}
+        txt = "\n".join("• %s — −%s%%" % (k.upper(), v) for k, v in p.items()) or "нет"
+        send(chat_id, "<b>Промокоды</b>\n\n" + txt + "\n\n/promo_add КОД 10",
+             keyboard=[[{"text": "Назад", "callback_data": "adm:more"}]]); return True
+    if data == "adm:bans":
+        b = DATA.get("banned") or {}
+        txt = "\n".join("• %s — %s" % (k, v.get("reason")) for k, v in b.items()) or "нет"
+        send(chat_id, "<b>Баны</b>\n\n" + txt, [[{"text": "Заблокировать", "callback_data": "adm:banadd"}],
+                                                [{"text": "Назад", "callback_data": "adm:more"}]]); return True
+    if data == "adm:banadd":
+        state[chat_id] = {"step": "ban_add"}
+        send(chat_id, "Пришлите: CHAT_ID причина"); return True
+    if data == "adm:ex":
+        send(chat_id, "Примеры работ\n\n/addexample bots — прислать фото\n/examples_list — список\n/delexample ID — удалить",
+             [[{"text": "Назад", "callback_data": "adm:more"}]]); return True
+    return False
+
+
+# ------------------------------------------------------------ напоминания ----
+def run_reminders():
+    now = int(time.time())
+    changed = False
+    for t in DATA.get("tickets", []):
+        if t.get("status") == "в работе" and not t.get("reminded") and now - int(t.get("ts") or now) > 2 * 86400:
+            t["reminded"] = now
+            changed = True
+            notify_admin("<b>Напоминание</b>\n\nЗаявка #%s в работе больше 2 дней.\n%s" % (
+                t.get("id"), (t.get("text") or "")[:300]))
+        if t.get("status") == "готово" and not t.get("asked_review") and now - int(t.get("done_ts") or t.get("ts") or now) > 3 * 86400:
+            t["asked_review"] = now
+            changed = True
+            try:
+                send(t.get("chat_id"), "Как всё прошло? Если всё ок — оставьте отзыв, это помогает.",
+                     [[{"text": "Оставить отзыв", "callback_data": "rev:add"}]])
+            except Exception:
+                pass
+    if changed:
+        save_data(DATA)
+
+
+def reminders_loop():
+    while True:
+        try:
+            run_reminders()
+        except Exception as e:
+            print("reminders error:", e)
+        time.sleep(1800)
+
+
+# ------------------------------------------------------- доступ к панели ----
+PANEL_CODES = {}
+
+
+def panel_new_code(chat_id):
+    code = "%06d" % random.randint(0, 999999)
+    PANEL_CODES[code] = {"chat_id": str(chat_id), "exp": time.time() + 600}
+    return code
+
+
+def panel_code_message(chat_id):
+    code = panel_new_code(chat_id)
+    url = "https://portfolio-bot-g7cf.onrender.com/panel?code=" + code
+    return ("<b>Панель — вход по коду</b>\n\nКод: <code>%s</code> (на 10 минут)\n%s\n\n"
+            "Код одноразовый — после входа панель запомнит доступ." % (code, url))
+
+
+def panel_code_ok(code):
+    v = PANEL_CODES.get(str(code))
+    if not v:
+        return False
+    if v["exp"] < time.time():
+        PANEL_CODES.pop(str(code), None)
+        return False
+    return True
+
+
+# ---------------------------------------------------- проверка прав по команде ----
+CMD_PERMS = {
+    "admins": "admins", "admin_add": "admins", "admin_role": "admins", "admin_del": "admins",
+    "admin_perm": "admins", "admin_info": "admins",
+    "settings": "settings", "prices": "settings", "setslot": "settings", "setowner": "settings",
+    "setfaq": "settings", "setabout": "settings", "setprice_svc": "settings", "service": "settings",
+    "set_title": "settings", "set_desc": "settings", "set_term": "settings",
+    "addexample": "settings", "delexample": "settings", "tpl_add": "settings", "tpl_del": "settings",
+    "templates": "settings", "promo_add": "settings", "promo_del": "settings", "promos": "settings",
+    "maintenance": "settings",
+    "rassylka": "broadcast", "notifyadmins": "broadcast", "broadcast_preview": "broadcast",
+    "export": "export", "exportdata": "export", "backup": "export", "csv": "export",
+    "ban": "ban", "unban": "ban", "bans": "ban", "antispam_set": "ban",
+    "pay": "pay",
+    "tickets": "tickets", "ticket": "tickets", "open_tickets": "tickets", "done_tickets": "tickets",
+    "findticket": "tickets", "ticketmsg": "tickets", "setstatus": "tickets", "who": "tickets",
+    "say": "tickets",
+    "note": "notes", "notes": "notes", "delnote": "notes", "clearstate": "notes",
+    "reviews": "reviews", "reviews_pending": "reviews",
+    "users": "users", "lastusers": "users", "segments": "users", "refstats": "users",
+    "stats": "stats", "stats7": "stats", "week": "stats", "healthcheck": "stats", "db": "stats",
+    "ping": "stats", "version": "stats", "chatinfo": "stats", "reminders": "stats",
+    "panel": "panel", "panelcode": "panel", "panel_code": "panel", "guides": "panel", "guide": "panel",
+    "guides_all": "panel",
+}
+
+
+def denied_cmd(chat_id, text):
+    cmd = text.split()[0].lstrip("/").split("@")[0]
+    need = CMD_PERMS.get(cmd)
+    if not need:
+        return False
+    return not can(chat_id, need)
+
+
+if os.environ.get("REMINDERS", "1") == "1":
+    try:
+        threading.Thread(target=reminders_loop, daemon=True).start()
+    except Exception as _e:
+        print("reminders start error:", _e)
 
 
 if __name__ == "__main__":
