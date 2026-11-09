@@ -1448,6 +1448,13 @@ def handle_message(msg):
         except Exception as _ce:
             log_error("calendar", _ce)
 
+    if is_admin(chat_id) and business_mode:
+        try:
+            if business_mode.handle_admin(text, chat_id, user):
+                return
+        except Exception as _ce:
+            log_error("business", _ce)
+
     if extra_client(text, chat_id, user):
         return
     if is_admin(chat_id) and extra_admin(text, chat_id, user):
@@ -1986,6 +1993,8 @@ def handle_callback(cb):
 _last_err = [0]
 def handle_update(update):
     try:
+        if business_mode and business_mode.handle_update(update):
+            return
         if "message" in update and update["message"].get("successful_payment"):
             m = update["message"]; sp = m["successful_payment"]
             amount = sp.get("total_amount", 0)
@@ -3394,6 +3403,18 @@ try:
 except Exception as _ce:
     calendar_mode = None
     print("calendar_mode load error:", _ce)
+
+# ------------------------------------- управление аккаунтом (business_mode) --
+try:
+    import business_mode
+    business_mode.start({
+        "send": send, "api": api, "kv_get": kv_get, "kv_set": kv_set,
+        "can": can, "is_admin": is_admin, "log": log_action,
+        "staff_ids": staff_ids, "notify_admin": notify_admin,
+    })
+except Exception as _ce:
+    business_mode = None
+    print("business_mode load error:", _ce)
 
 if os.environ.get("REMINDERS", "1") == "1":
     try:
