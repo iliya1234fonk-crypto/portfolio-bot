@@ -238,18 +238,24 @@ def _handle_owner_dot(bcid, conn, chat, sender, msg, text):
     if cmd == ".word":
         if not arg:
             _bdel(bcid, chat_id, mid)
-            _bsend(bcid, chat_id, "Формат: <code>.word твоё_слово</code> (сообщение с командой удалится)")
+            _bsend(bcid, chat_id, "Формат: <code>.word твоё_слово</code>\n(команда удалится, если у бота есть право на удаление)")
             return True
-        word = arg.split()[0]
+        word = arg.split()[0].strip(".,!?;:\"'()[]«»")
+        if not word:
+            _bdel(bcid, chat_id, mid); _bsend(bcid, chat_id, "Слово пустое. Пример: <code>.word банан</code>"); return True
         with LM:
             m = _load()
             m.setdefault("games", {})[_gkey(bcid, chat_id)] = {
                 "word": word.lower(), "show": word, "by": sender.get("id"), "ts": int(time.time()),
             }
             _save(m)
-        _bdel(bcid, chat_id, mid)
-        _bsend(bcid, chat_id, "🎯 <b>Игра: угадай слово</b>\n\nБукв: %d\n<code>%s</code>\n\nПиши варианты одним сообщением." % (
-            len(word), _mask_word(word)))
+        dr = _bdel(bcid, chat_id, mid)
+        note = "" if (dr or {}).get("ok", True) else "\n\n<i>(команду не смог удалить — удали своё сообщение «.word …» вручную, чтобы не палить слово)</i>"
+        _bsend(bcid, chat_id,
+               "┌  <b>УГАДАЙ СЛОВО</b>  🎯\n"
+               "│  Букв: <b>%d</b>\n"
+               "│  <code>%s</code>\n"
+               "└  Пиши вариант одним сообщением%s" % (len(word), _mask_word(word), note))
         return True
 
     if cmd == ".wordoff":
