@@ -299,6 +299,8 @@ def drop_admin(cid):
 
 def toggle_perm(cid, perm, on):
     cid = str(cid)
+    if staff_map().get(cid, {}).get("root") or staff_map().get(cid, {}).get("role") == "owner":
+        return False, "У владельца всегда все права — менять нечего."
     if perm not in PERM_TITLES:
         return False, "Нет такого права. Есть: " + ", ".join(PERM_TITLES.keys())
     v = SETTINGS.setdefault("admins", {}).setdefault(cid, {})
@@ -2179,13 +2181,14 @@ def admin_card(chat_id, cid):
             rows.append(buf); buf = []
     if buf:
         rows.append(buf)
-    buf = []
-    for k in PERM_TITLES:
-        buf.append({"text": ("✓ " if k in p else "✕ ") + PERM_TITLES[k], "callback_data": "admx:perm:%s:%s" % (cid, k)})
-        if len(buf) == 2:
-            rows.append(buf); buf = []
-    if buf:
-        rows.append(buf)
+    if not v.get("root"):
+        buf = []
+        for k in PERM_TITLES:
+            buf.append({"text": ("✓ " if k in p else "✕ ") + PERM_TITLES[k], "callback_data": "admx:perm:%s:%s" % (cid, k)})
+            if len(buf) == 2:
+                rows.append(buf); buf = []
+        if buf:
+            rows.append(buf)
     rows.append([{"text": "Удалить админа", "callback_data": "admx:del:%s" % cid},
                  {"text": "Назад", "callback_data": "admx:home"}])
     send(chat_id, "\n".join(lines), keyboard=rows)
