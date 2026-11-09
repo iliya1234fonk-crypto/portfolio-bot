@@ -3039,7 +3039,7 @@ def extra_admin(text, chat_id, user):
         return send(chat_id, panel_code_message(chat_id)) or True
 
     if t == "/reminders":
-        return send(chat_id, "Напоминания включены:\n• «в работе» > 2 дней → пинг админам\n• «готово» > 3 дней → просьба об отзыве клиенту") or True
+        return send(chat_id, "Напоминания включены:\n• «новый» > 24 ч → пинг админам\n• «в работе» > 2 дней → пинг админам\n• «готово» > 3 дней → просьба об отзыве клиенту") or True
 
     return False
 
@@ -3287,7 +3287,13 @@ def run_reminders():
     now = int(time.time())
     changed = False
     for t in DATA.get("tickets", []):
-        if t.get("status") == "в работе" and not t.get("reminded") and now - int(t.get("ts") or now) > 2 * 86400:
+        age = now - int(t.get("ts") or now)
+        if t.get("status") == "новый" and not t.get("reminded_new") and age > 86400:
+            t["reminded_new"] = now
+            changed = True
+            notify_admin("<b>Напоминание</b>\n\nЗаявка #%s висит как «новая» больше 24 часов.\n%s\n\nОтветить: /say %s текст" % (
+                t.get("id"), (t.get("text") or "")[:300], t.get("id")))
+        if t.get("status") == "в работе" and not t.get("reminded") and age > 2 * 86400:
             t["reminded"] = now
             changed = True
             notify_admin("<b>Напоминание</b>\n\nЗаявка #%s в работе больше 2 дней.\n%s" % (
