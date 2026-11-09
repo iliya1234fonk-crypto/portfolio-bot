@@ -40,7 +40,9 @@ DEFAULT_CFG = {
 
 
 def _blank():
-    return {"connections": {}, "cfg": dict(DEFAULT_CFG), "seen": {}, "last": {}, "stats": {"in": 0, "out": 0, "leads": 0}, "log": []}
+    return {"connections": {}, "cfg": dict(DEFAULT_CFG), "seen": {}, "last": {},
+            "stats": {"in": 0, "out": 0, "leads": 0}, "log": [],
+            "games": {}, "mutes": {}}  # games/mutes keyed by "bcid:chat_id"
 
 
 def _load():
@@ -72,6 +74,10 @@ def _load():
         out["stats"].update({k: int(v) for k, v in data["stats"].items() if k in out["stats"]})
     if isinstance(data.get("log"), list):
         out["log"] = data["log"][-120:]
+    if isinstance(data.get("games"), dict):
+        out["games"] = data["games"]
+    if isinstance(data.get("mutes"), dict):
+        out["mutes"] = data["mutes"]
     return out
 
 
@@ -185,6 +191,129 @@ def _pick_reply(m, conn, chat_id, text):
     return fb or None
 
 
+# ----------------------------------------------------------- игры / модерация --
+ROASTS = [
+    "тишина в студии 😶", "молчу-молчу, а тебя не слышу", "сообщение ушло в космос",
+    "микрофон выключен, талант тоже", "я это не читал и вам не советую 😶",
+    "попробуй ещё раз... хотя нет", "звук пропал, какая жалость",
+    "сообщение съел цифровой хомяк", "режим библиотеки: ш-ш-ш",
+]
+
+
+def _bsend(bcid, chat_id, text, keyboard=None):
+    p = {"chat_id": chat_id, "text": text, "business_connection_id": bcid}
+    if keyboard:
+        p["reply_markup"] = json.dumps({"inline_keyboard": keyboard})
+    return _bapi("sendMessage", **p)
+
+
+def _bdel(bcid, chat_id, message_id):
+    try:
+        return _bapi("deleteMessage", chat_id=chat_id, message_id=message_id, business_connection_id=bcid)
+    except Exception:
+        try:
+            return _bapi("deleteMessage", chat_id=chat_id, message_id=message_id)
+        except Exception as e:
+            _log("del", e)
+            return {"ok": False}
+
+
+def _gkey(bcid, chat_id):
+    return "%s:%s" % (bcid, chat_id)
+
+
+def _mask_word(word):
+    return " ".join("•" for _ in word)
+
+
+def _handle_owner_dot(bcid, conn, chat, sender, msg, text):
+    """Команды владельца (.word, .mute, .unmute) в чатах аккаунта."""
+    chat_id = chat.get("id")
+    mid = msg.get("message_id")
+    low = text.strip()
+    parts = low.split(None, 1)
+    cmd = parts[0].lower() if parts else ""
+    arg = parts[1].strip() if len(parts) > 1 else ""
+
+    if cmd == ".word":
+        if not arg:
+            _bdel(bcid, chat_id, mid)
+            _bsend(bcid, chat_id, "Формат: <code>.word твоё_слово</code> (сообщение с командой удалится)")
+            return True
+        word = arg.split()[0]
+        with LM:
+            m = _load()
+            m.setdefault("games", {})[_gkey(bcid, chat_id)] = {
+                "word": word.lower(), "show": word, "by": sender.get("id"), "ts": int(time.time()),
+            }
+            _save(m)
+        _bdel(bcid, chat_id, mid)
+        _bsend(bcid, chat_id, "🎯 <b>Игра: угадай слово</b>\n\nБукв: %d\n<code>%s</code>\n\nПиши варианты одним сообщением." % (
+            len(word), _mask_word(word)))
+        return True
+
+    if cmd == ".wordoff":
+        with LM:
+            m = _load(); m.setdefault("games", {}).pop(_gkey(bcid, chat_id), None); _save(m)
+        _bdel(bcid, chat_id, mid)
+        _bsend(bcid, chat_id, "Игра остановлена.")
+        return True
+
+    if cmd == ".mute":
+        with LM:
+            m = _load()
+            m.setdefault("mutes", {})[_gkey(bcid, chat_id)] = {"by": sender.get("id"), "ts": int(time.time())}
+            _save(m)
+        _bdel(bcid, chat_id, mid)
+        kb = [[{"text": "Размутить", "callback_data": "bizunmute:%s:%s" % (bcid, chat_id)}]]
+        _bsend(bcid, chat_id, "молчи 😶", keyboard=kb)
+        return True
+
+    if cmd in (".unmute", ".unmut"):
+        with LM:
+            m = _load(); m.setdefault("mutes", {}).pop(_gkey(bcid, chat_id), None); _save(m)
+        _bdel(bcid, chat_id, mid)
+        _bsend(bcid, chat_id, "Ладно, говори 🙂")
+        return True
+
+    return False
+
+
+def _handle_chat_fun(bcid, conn, chat, sender, msg, text):
+    """Реакции на сообщения других: угадывание слова, мут."""
+    chat_id = chat.get("id")
+    mid = msg.get("message_id")
+    key = _gkey(bcid, chat_id)
+    low = (text or "").strip().lower()
+
+    # игра
+    with LM:
+        m = _load()
+        game = (m.get("games") or {}).get(key)
+    if game and low and not low.startswith("."):
+        if low == game.get("word") or low == str(game.get("show", "")).lower():
+            name = (sender.get("first_name") or "Кто-то")
+            with LM:
+                m = _load(); m.setdefault("games", {}).pop(key, None); _save(m)
+            _bsend(bcid, chat_id, "🎉 %s угадал(а)! Слово: <b>%s</b>" % (name, game.get("show", game.get("word"))))
+            return True
+        # неверная попытка — не даём автоответу вклиниться
+        _bsend(bcid, chat_id, "Не то 🙃 (%d букв: <code>%s</code>)" % (len(game.get("show", "")), _mask_word(game.get("show", ""))))
+        return True
+
+    # мут
+    with LM:
+        m = _load()
+        muted = key in (m.get("mutes") or {})
+    if muted:
+        _bdel(bcid, chat_id, mid)
+        import random
+        roast = random.choice(ROASTS)
+        _bsend(bcid, chat_id, roast)
+        return True
+    return False
+
+
 # --------------------------------------------------------------- апдейты --
 def handle_business_connection(upd):
     bc = upd.get("business_connection") or {}
@@ -213,6 +342,7 @@ def handle_business_connection(upd):
 
 
 def handle_business_message(upd):
+    is_edit = "edited_business_message" in upd
     msg = upd.get("business_message") or upd.get("edited_business_message")
     if not msg:
         return False
@@ -224,7 +354,6 @@ def handle_business_message(upd):
     sender = msg.get("from") or {}
     text = (msg.get("text") or msg.get("caption") or "").strip()
 
-    # не отвечаем на сообщения самого владельца/ботов
     if sender.get("is_bot"):
         return True
 
@@ -233,17 +362,35 @@ def handle_business_message(upd):
         conn = (m.get("connections") or {}).get(bcid) or {}
         if not conn.get("enabled", True):
             return True
-        # если пишет сам владелец аккаунта в своём контексте — пропускаем автоответ
-        owner_chat = conn.get("user_chat_id")
-        owner_id = ((conn.get("user") or {}).get("id"))
-        if owner_chat and str(chat_id) == str(owner_chat):
-            return True
-        if owner_id and str(sender.get("id")) == str(owner_id):
-            return True
 
+    owner_chat = conn.get("user_chat_id")
+    owner_id = ((conn.get("user") or {}).get("id"))
+    is_owner = (owner_id and str(sender.get("id")) == str(owner_id)) or (owner_chat and str(chat_id) == str(owner_chat))
+
+    # команды владельца (.word .mute .unmute) — работаем и в ЛС
+    if is_owner and text.startswith(".") and not is_edit:
+        if _handle_owner_dot(bcid, conn, chat, sender, msg, text):
+            return True
+        return True
+
+    # владелец пишет сам — не автоотвечаем, но команды обработали выше
+    if is_owner:
+        return True
+
+    # игры/мут для сообщений других
+    if not is_edit:
+        try:
+            if _handle_chat_fun(bcid, conn, chat, sender, msg, text):
+                return True
+        except Exception as e:
+            _log("fun", e)
+
+    name = (sender.get("first_name") or "") + ((" " + sender.get("last_name")) if sender.get("last_name") else "")
+    uname = sender.get("username")
+    with LM:
+        m = _load()
+        conn = (m.get("connections") or {}).get(bcid) or {}
         m["stats"]["in"] = int(m["stats"].get("in", 0)) + 1
-        name = (sender.get("first_name") or "") + ((" " + sender.get("last_name")) if sender.get("last_name") else "")
-        uname = sender.get("username")
         _addlog(m, "in", "%s @%s: %s" % (name or chat_id, uname or "-", (text or "[медиа]")[:120]))
 
         reply = _pick_reply(m, conn, chat_id, text)
@@ -260,7 +407,6 @@ def handle_business_message(upd):
             _save(m)
 
         if (m.get("cfg") or {}).get("notify_admins", True) and text:
-            # уведомляем админов о новом обращении (не чаще чем автоответ — лог уже есть)
             if not (m.get("seen") or {}).get(str(chat_id)) or reply is None:
                 _notify("<b>Сообщение (аккаунт)</b>\n\n%s (@%s)\n<code>%s</code>\n\n%s" % (
                     name or "-", uname or "-", chat_id, text[:700]))
@@ -286,6 +432,11 @@ HELP = (
     "/biz_notify on|off — уведомлять админов о сообщениях\n"
     "/biz_stats — статистика\n"
     "/biz_log — журнал\n\n"
+    "<b>Команды в подключённых чатах (пишешь ты):</b>\n"
+    "<code>.word слово</code> — загадай слово (команда удалится, друг угадывает)\n"
+    "<code>.wordoff</code> — остановить игру\n"
+    "<code>.mute</code> — «молчи 😶» + кнопка размутить, сообщения собеседника удаляются\n"
+    "<code>.unmute</code> — размутить\n\n"
     "Подключить: @BotFather → Bot Settings → <b>Business Mode</b> → вкл,\n"
     "затем в Telegram: Настройки → Автоматизация чатов → выбрать бота."
 )
@@ -417,13 +568,42 @@ def handle_admin(text, chat_id, user):
 
 
 # --------------------------------------------------------------- интеграция --
+def handle_callback(cb):
+    data = (cb.get("data") or "")
+    if not data.startswith("bizunmute:"):
+        return False
+    # bizunmute:bcid:chat_id
+    parts = data.split(":", 2)
+    if len(parts) != 3:
+        _bapi("answerCallbackQuery", callback_query_id=cb.get("id"), text="Ошибка")
+        return True
+    _, bcid, chat_id = parts
+    with LM:
+        m = _load(); m.setdefault("mutes", {}).pop(_gkey(bcid, chat_id), None); _save(m)
+    _bapi("answerCallbackQuery", callback_query_id=cb.get("id"), text="Размучено")
+    # обновим сообщение, если можем
+    msg = cb.get("message") or {}
+    try:
+        _bapi("editMessageText", chat_id=msg.get("chat", {}).get("id"), message_id=msg.get("message_id"),
+              text="Ладно, говори 🙂", business_connection_id=bcid)
+    except Exception:
+        try:
+            _bapi("editMessageText", chat_id=msg.get("chat", {}).get("id"), message_id=msg.get("message_id"),
+                  text="Ладно, говори 🙂")
+        except Exception:
+            _bsend(bcid, chat_id, "Ладно, говори 🙂")
+    return True
+
+
 def handle_update(update):
     if "business_connection" in update:
         return handle_business_connection(update)
     if "business_message" in update or "edited_business_message" in update:
         return handle_business_message(update)
     if "deleted_business_messages" in update:
-        return True  # принимаем, ничего не делаем
+        return True
+    if "callback_query" in update and (update["callback_query"].get("data") or "").startswith("bizunmute:"):
+        return handle_callback(update["callback_query"])
     return False
 
 
