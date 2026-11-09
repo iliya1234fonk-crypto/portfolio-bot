@@ -405,6 +405,10 @@ def _make_change_photo(title, details):
 
 
 def notify_change(who_name, title, details):
+    try:
+        log_action(who_name, title, details)
+    except Exception as e:
+        print("log notify:", e)
     caption = "<b>%s</b>\n\n%s\n\nИзменил: %s" % (title, details, who_name)
     photo = _make_change_photo(title, details)
     for aid in staff_ids():
@@ -488,16 +492,106 @@ def add_ticket(chat_id, user, kind, text, service=""):
          "kind": kind, "service": service, "text": text, "status": "новый"}
     DATA.setdefault("tickets", []).append(t)
     DATA["tickets"] = DATA["tickets"][-200:]
+    add_tag(chat_id, "заявка", save=False)
     save_data(DATA); return t
 
-def set_ticket_status(tid, status):
+def set_ticket_status(tid, status, actor=""):
     for t in DATA.get("tickets", []):
         if str(t.get("id")) == str(tid):
+            old = t.get("status")
             t["status"] = status
+            t["updated"] = int(time.time())
             if status == "готово":
                 t["done_ts"] = int(time.time())
-            save_data(DATA); return t
+                add_tag(t.get("chat_id"), "клиент", save=False)
+            save_data(DATA)
+            if old != status:
+                log_action(actor or "бот", "Статус заявки #%s" % tid, "%s → %s" % (old, status))
+                if status == "готово" and not t.get("recv_done"):
+                    t["recv_done"] = 1
+                    save_data(DATA)
+                    try:
+                        send(t.get("chat_id"),
+                             "<b>Заявка #%s готова.</b>\n\nПосмотрите результат. Если что-то поправить — напишите, сделаю. "
+                             "Если всё ок — можно оставить отзыв." % tid,
+                             [[{"text": "Оставить отзыв", "callback_data": "rev:add"}],
+                              [{"text": "Написать в боте", "callback_data": "ask"}]])
+                    except Exception as e:
+                        print("done notify:", e)
+            return t
     return None
+
+
+# ---------- теги клиентов ----------
+def tags_of(chat_id):
+    t = (DATA.get("tags") or {}).get(str(chat_id))
+    return list(t) if isinstance(t, list) else []
+
+
+def add_tag(chat_id, tag, save=True):
+    tag = str(tag or "").strip().lstrip("#")[:24]
+    if not tag:
+        return False
+    t = tags_of(chat_id)
+    if tag in t:
+        return False
+    t.append(tag)
+    DATA.setdefault("tags", {})[str(chat_id)] = t[-12:]
+    if save:
+        save_data(DATA)
+    return True
+
+
+def del_tag(chat_id, tag, save=True):
+    t = tags_of(chat_id)
+    tag = str(tag or "").strip().lstrip("#")
+    if tag not in t:
+        return False
+    t.remove(tag)
+    DATA.setdefault("tags", {})[str(chat_id)] = t
+    if save:
+        save_data(DATA)
+    return True
+
+
+def all_tags():
+    counts = {}
+    for cid, ts in (DATA.get("tags") or {}).items():
+        for t in ts or []:
+            counts[t] = counts.get(t, 0) + 1
+    return counts
+
+
+def clients_by_tag(tag):
+    tag = str(tag or "").strip().lstrip("#").lower()
+    out = []
+    for cid, ts in (DATA.get("tags") or {}).items():
+        if any(str(t).lower() == tag for t in (ts or [])):
+            out.append(cid)
+    return out
+
+
+# ---------- журнал действий ----------
+def log_action(actor, action, extra=""):
+    try:
+        log = DATA.setdefault("log", [])
+        log.append({"ts": int(time.time()), "by": str(actor), "a": str(action)[:80], "x": str(extra)[:240]})
+        del log[:-500]
+        save_data(DATA)
+    except Exception as e:
+        print("log error:", e)
+
+
+def log_text(limit=15):
+    log = (DATA.get("log") or [])[-limit:]
+    if not log:
+        return "Журнал пока пуст."
+    lines = ["<b>Журнал действий</b>", ""]
+    for e in reversed(log):
+        lines.append("%s · <b>%s</b> · %s\n<i>%s</i>" % (
+            time.strftime("%d.%m %H:%M", time.localtime(int(e.get("ts") or 0))),
+            e.get("a", "-"), e.get("by", "-"), (e.get("x") or "")[:160]))
+    return "\n".join(lines)
 
 def find_ticket(tid):
     for t in DATA.get("tickets", []):
@@ -690,6 +784,128 @@ def send_video_file(chat_id, caption, keyboard=None, filename="", supports_strea
                 print("Video retry error:", e)
         return send(chat_id, caption, keyboard)
     return res
+
+
+# ---------- видео-разделы ----------
+VIDEO_IDS_FILE = os.path.join(HERE, "video_ids.json")
+VIDEO_IDS = {}
+_video_loaded = False
+
+
+def _video_cache_load():
+    global VIDEO_IDS, _video_loaded
+    if _video_loaded:
+        return
+    _video_loaded = True
+    d = kv_get("video_ids", None)
+    if not isinstance(d, dict):
+        try:
+            with open(VIDEO_IDS_FILE, encoding="utf-8") as f:
+                d = json.load(f)
+        except Exception:
+            d = {}
+    VIDEO_IDS = d if isinstance(d, dict) else {}
+
+
+def _video_cache_save(name, file_id):
+    global VIDEO_IDS
+    VIDEO_IDS[name] = file_id
+    kv_set("video_ids", VIDEO_IDS)
+    try:
+        with open(VIDEO_IDS_FILE, "w", encoding="utf-8") as f:
+            json.dump(VIDEO_IDS, f, ensure_ascii=False, indent=1)
+    except Exception as e:
+        print("video ids save:", e)
+
+
+def _video_markup(keyboard, reply_keyboard):
+    if keyboard:
+        return {"inline_keyboard": keyboard}
+    if reply_keyboard:
+        return reply_keyboard
+    return None
+
+
+def _video_json(chat_id, video, caption, keyboard, reply_keyboard):
+    payload = {
+        "chat_id": chat_id,
+        "video": video,
+        "caption": premium(caption),
+        "parse_mode": "HTML",
+        "supports_streaming": True,
+    }
+    mk = _video_markup(keyboard, reply_keyboard)
+    if mk:
+        payload["reply_markup"] = mk
+    return api("sendVideo", **payload)
+
+
+def _video_upload(chat_id, path, caption, keyboard, reply_keyboard):
+    payload = {
+        "chat_id": chat_id,
+        "caption": premium(caption),
+        "parse_mode": "HTML",
+        "supports_streaming": "true",
+    }
+    mk = _video_markup(keyboard, reply_keyboard)
+    if mk:
+        payload["reply_markup"] = json.dumps(mk)
+    try:
+        with open(path, "rb") as f:
+            res = requests.post(
+                BASE + "/sendVideo",
+                data=payload,
+                files={"video": (os.path.basename(path), f, "video/mp4")},
+                timeout=180,
+            ).json()
+    except Exception as e:
+        print("Video upload error:", e)
+        return {}
+    if not res.get("ok"):
+        print("Video upload failed:", res.get("description"))
+    return res
+
+
+def _video_path(name):
+    for cand in (os.path.join(HERE, "assets", "videos", name + ".mp4"),
+                 os.path.join(HERE, "assets", name + ".mp4"),
+                 os.path.join(HERE, name + ".mp4")):
+        if os.path.exists(cand):
+            return cand
+    return ""
+
+
+def send_section(chat_id, caption, keyboard=None, name="", photo="", reply_keyboard=None):
+    """Отправляет раздел видео (с кэшем file_id), при сбое — фото, затем текст."""
+    if name:
+        _video_cache_load()
+        fid = VIDEO_IDS.get(name)
+        if fid:
+            res = _video_json(chat_id, fid, caption, keyboard, reply_keyboard)
+            if res.get("ok"):
+                return res
+            if res.get("error_code") in (400, 403):
+                VIDEO_IDS.pop(name, None)
+        path = _video_path(name)
+        if path:
+            res = _video_upload(chat_id, path, caption, keyboard, reply_keyboard)
+            if res.get("ok"):
+                vid = ((res.get("result") or {}).get("video") or {}).get("file_id")
+                if vid:
+                    _video_cache_save(name, vid)
+                return res
+            if keyboard:
+                # повтор без клавиатуры: часть ошибок связана с разметкой
+                res = _video_upload(chat_id, path, caption, None, None)
+                if res.get("ok"):
+                    vid = ((res.get("result") or {}).get("video") or {}).get("file_id")
+                    if vid:
+                        _video_cache_save(name, vid)
+                    send(chat_id, "Выберите действие:", keyboard)
+                    return res
+    if photo:
+        return send_photo_file(chat_id, caption, keyboard, photo, reply_keyboard=reply_keyboard)
+    return send(chat_id, caption, keyboard, reply_keyboard=reply_keyboard)
 
 
 def answer_cb(cb_id):
@@ -892,18 +1108,18 @@ def contact_kb():
 
 # ---------- отправка ----------
 def show_menu(chat_id):
-    send_photo_file(chat_id, HELLO, MENU, "intro.jpg", reply_keyboard=REPLY_KB)
+    send_section(chat_id, HELLO, MENU, "intro", "intro.jpg", reply_keyboard=REPLY_KB)
 
 
 def show_catalog(chat_id):
     set_segment(chat_id, "catalog"); bump_stat("leads")
-    send_photo_file(chat_id, catalog_text(), catalog_kb(), "scr_catalog.jpg")
+    send_section(chat_id, catalog_text(), catalog_kb(), "catalog", "scr_catalog.jpg")
 
 
 def show_service(chat_id, sid):
     set_segment(chat_id, sid)
     item = svc(sid)
-    send_photo_file(chat_id, service_caption(item), service_kb(item), item.get("photo",""))
+    send_section(chat_id, service_caption(item), service_kb(item), "svc_%s" % sid, item.get("photo", ""))
 
 
 def reply_kb(chat_id):
@@ -918,6 +1134,7 @@ def notify_admin(text, reply_to=None):
 
 def handle_buy(chat_id, user, sid):
     item = svc(sid)
+    add_tag(chat_id, "интерес:" + sid)
     notify_admin(
         "<b>ЗАКАЗ / ИНТЕРЕС</b>\n\n"
         "Услуга: <b>%s</b> (%s)\n"
@@ -968,7 +1185,7 @@ def broadcast():
     ok = fail = 0
     kb = broadcast_kb()
     for cid in list(USERS.keys()):
-        r = send_photo_file(cid, BROADCAST_TEXT, kb, "trust.jpg")
+        r = send_section(cid, BROADCAST_TEXT, kb, "trust", "trust.jpg")
         if r.get("ok"):
             ok += 1
         else:
@@ -991,6 +1208,8 @@ def show_reviews(chat_id):
     else:
         lines.append("Пока нет опубликованных отзывов.")
     kb = [[{"text":"Оставить отзыв","callback_data":"rev:add"}],[{"text":"Оформить заявку","callback_data":"brief:start"}],[{"text":"В меню","callback_data":"menu"}]]
+    if _video_path("reviews"):
+        send_section(chat_id, "<b>Отзывы и FAQ</b>\n\nЧто пишут клиенты — на видео. Ниже статус, частые вопросы и живые отзывы.", None, "reviews")
     send(chat_id, "\n".join(lines), kb, reply_keyboard=REPLY_KB)
 
 # ---------- настройки (админ) ----------
@@ -1222,6 +1441,13 @@ def handle_message(msg):
         state.pop(chat_id, None)
         return send(chat_id, "Отменено.")
 
+    if is_admin(chat_id) and calendar_mode:
+        try:
+            if calendar_mode.handle(chat_id, text, user):
+                return
+        except Exception as _ce:
+            log_error("calendar", _ce)
+
     if extra_client(text, chat_id, user):
         return
     if is_admin(chat_id) and extra_admin(text, chat_id, user):
@@ -1230,6 +1456,7 @@ def handle_message(msg):
     if text.startswith("/start"):
         state.pop(chat_id, None)
         bump_stat("starts")
+        add_tag(chat_id, "новый")
         payload = text[6:].strip()
         if payload.startswith("ref_"):
             ref = payload[4:].strip()
@@ -1245,17 +1472,17 @@ def handle_message(msg):
         return send(chat_id, "Ваш chat_id: <code>%s</code>" % chat_id)
 
     if text == "/about":
-        return send(chat_id, ABOUT, [[{"text": "Каталог услуг", "callback_data": "catalog"}]])
+        return send_section(chat_id, ABOUT, [[{"text": "Каталог услуг", "callback_data": "catalog"}]], "about", "hero.png")
 
     if text in ("/catalog", "/menu"):
         return show_catalog(chat_id) if text == "/catalog" else show_menu(chat_id)
     if text == "/examples":
-        return send_photo_file(chat_id, EXAMPLES_ASK, EXAMPLES_KB, "scr_examples.jpg")
+        return send_section(chat_id, EXAMPLES_ASK, EXAMPLES_KB, "examples", "scr_examples.jpg")
     if text == "/trust":
         rows = [[{"text": "Примеры работ", "callback_data": "examples"}],[{"text": "Каталог с ценами", "callback_data": "catalog"}],[{"text": "В меню", "callback_data": "menu"}]]
-        return send_photo_file(chat_id, TRUST_CAPTION, rows, "trust.jpg")
+        return send_section(chat_id, TRUST_CAPTION, rows, "trust", "trust.jpg")
     if text == "/contact":
-        return send_photo_file(chat_id, contact_text(), contact_kb(), "scr_contact.jpg")
+        return send_section(chat_id, contact_text(), contact_kb(), "contact", "scr_contact.jpg")
 
     if text == "/help_admin" and is_admin(chat_id):
         return send(chat_id, ADMIN_HELP)
@@ -1446,14 +1673,19 @@ def handle_message(msg):
         arg = text.split(None,1)[1].strip() if len(text.split(None,1))>1 else ""
         ok = fail = 0
         kb = broadcast_kb()
+        tag_filter = arg[4:].strip() if arg.lower().startswith("tag:") else ""
+        tag_ids = set(clients_by_tag(tag_filter)) if tag_filter else set()
         for cid in list(USERS.keys()):
-            if arg:
+            if tag_filter:
+                if str(cid) not in tag_ids: continue
+            elif arg:
                 seg = (DATA.get("segments") or {}).get(str(cid),"")
                 if arg.lower() not in str(seg).lower(): continue
-            r = send_photo_file(cid, BROADCAST_TEXT, kb, "trust.jpg")
+            r = send_section(cid, BROADCAST_TEXT, kb, "trust", "trust.jpg")
             if r.get("ok"): ok+=1
             else: fail+=1
             time.sleep(1.0)
+        log_action(user.get("username") or user.get("first_name") or str(chat_id), "Рассылка", "доставлено %s, ошибок %s, фильтр %s" % (ok, fail, arg or "всем"))
         return send(chat_id, "Разослано: %s. Не дошло: %s. Фильтр: %s" % (ok, fail, arg or "всем"))
 
     if text == "/settings" and is_admin(chat_id):
@@ -1482,16 +1714,16 @@ def handle_message(msg):
         if qk == "catalog":
             return show_catalog(chat_id)
         if qk == "examples":
-            return send_photo_file(chat_id, EXAMPLES_ASK, EXAMPLES_KB, "scr_examples.jpg")
+            return send_section(chat_id, EXAMPLES_ASK, EXAMPLES_KB, "examples", "scr_examples.jpg")
         if qk == "trust":
             rows = [
                 [{"text": "Примеры работ", "callback_data": "examples"}],
                 [{"text": "Каталог с ценами", "callback_data": "catalog"}],
                 [{"text": "В меню", "callback_data": "menu"}],
             ]
-            return send_photo_file(chat_id, TRUST_CAPTION, rows, "trust.jpg")
+            return send_section(chat_id, TRUST_CAPTION, rows, "trust", "trust.jpg")
         if qk == "contact":
-            return send_photo_file(chat_id, contact_text(), contact_kb(), "scr_contact.jpg")
+            return send_section(chat_id, contact_text(), contact_kb(), "contact", "scr_contact.jpg")
         if qk == "reviews":
             return show_reviews(chat_id)
         if qk == "faq_status":
@@ -1560,6 +1792,7 @@ def handle_message(msg):
         state.pop(chat_id, None)
         rid = next_id()
         DATA.setdefault("reviews", []).append({"id": rid, "chat_id": str(chat_id), "name": user.get("first_name","-"), "username": user.get("username","-"), "text": text, "status":"pending"})
+        add_tag(chat_id, "отзыв", save=False)
         save_data(DATA)
         notify_admin("<b>НОВЫЙ ОТЗЫВ (на модерации)</b>\n\n%s (@%s)\n<code>%s</code>\n\n%s" % (user.get("first_name","-"), user.get("username","-"), chat_id, text),
                      reply_to=chat_id)
@@ -1598,7 +1831,7 @@ def handle_message(msg):
         return r
     if q == "custom":
         state[chat_id] = {"step": "custom"}
-        return send_photo_file(chat_id, CUSTOM_ASK, [[{"text": "В меню", "callback_data": "menu"}]], "scr_custom.jpg")
+        return send_section(chat_id, CUSTOM_ASK, [[{"text": "В меню", "callback_data": "menu"}]], "svc_custom_form", "scr_custom.jpg")
 
     send(chat_id, "Выберите пункт в меню.", MENU, reply_keyboard=REPLY_KB)
 
@@ -1608,6 +1841,14 @@ def handle_callback(cb):
     user = cb.get("from", {})
     data = cb.get("data", "")
     answer_cb(cb["id"])
+
+    if calendar_mode:
+        try:
+            if calendar_mode.on_callback(data, chat_id, user):
+                return
+        except Exception as _ce:
+            log_error("calendar", _ce)
+
 
     if (data.startswith("reply:") or data.startswith("qr:")) and not can(chat_id, "reply"):
         return send(chat_id, "Нет прав на ответы клиентам. /myrights")
@@ -1620,20 +1861,20 @@ def handle_callback(cb):
     if data == "catalog":
         return show_catalog(chat_id)
     if data == "examples":
-        return send_photo_file(chat_id, EXAMPLES_ASK, EXAMPLES_KB, "scr_examples.jpg")
+        return send_section(chat_id, EXAMPLES_ASK, EXAMPLES_KB, "examples", "scr_examples.jpg")
     if data == "ex_bots":
         set_segment(chat_id, "bots")
-        return send_photo_file(
+        return send_section(
             chat_id, EXAMPLES_BOTS_CAPTION,
             [[{"text": "Примеры сайтов", "callback_data": "ex_sites"}], [{"text": "В меню", "callback_data": "menu"}]],
-            "examples_bots.jpg",
+            "ex_bots", "examples_bots.jpg",
         )
     if data == "ex_sites":
         set_segment(chat_id, "sites")
-        return send_photo_file(
+        return send_section(
             chat_id, EXAMPLES_SITES_CAPTION,
             [[{"text": "Примеры ботов", "callback_data": "ex_bots"}], [{"text": "В меню", "callback_data": "menu"}]],
-            "examples_sites.jpg",
+            "ex_sites", "examples_sites.jpg",
         )
     if data == "trust":
         rows = [
@@ -1641,15 +1882,15 @@ def handle_callback(cb):
             [{"text": "Каталог с ценами", "callback_data": "catalog"}],
             [{"text": "В меню", "callback_data": "menu"}],
         ]
-        return send_photo_file(chat_id, TRUST_CAPTION, rows, "trust.jpg")
+        return send_section(chat_id, TRUST_CAPTION, rows, "trust", "trust.jpg")
     if data == "contact":
-        return send_photo_file(chat_id, contact_text(), contact_kb(), "scr_contact.jpg")
+        return send_section(chat_id, contact_text(), contact_kb(), "contact", "scr_contact.jpg")
     if data == "custom":
         state[chat_id] = {"step": "custom"}
-        return send_photo_file(chat_id, CUSTOM_ASK, [[{"text": "В меню", "callback_data": "menu"}]], "scr_custom.jpg")
+        return send_section(chat_id, CUSTOM_ASK, [[{"text": "В меню", "callback_data": "menu"}]], "svc_custom_form", "scr_custom.jpg")
     if data == "bargain":
         state[chat_id] = {"step": "bargain"}
-        return send_photo_file(chat_id, BARGAIN_ASK, [[{"text": "В меню", "callback_data": "menu"}]], "scr_catalog.jpg")
+        return send_section(chat_id, BARGAIN_ASK, [[{"text": "В меню", "callback_data": "menu"}]], "catalog", "scr_catalog.jpg")
     if data == "ask":
         state[chat_id] = {"step": "ask"}
         return send(chat_id, ASK_PROMPT, [[{"text": "В меню", "callback_data": "menu"}]])
@@ -1862,6 +2103,12 @@ def panel_snapshot():
         "reviews": list(reversed((DATA.get("reviews") or [])[-12:])),
         "admins": admins,
         "promos": SETTINGS.get("promos") or {},
+        "tags": [{"id": cid, "name": USERS.get(str(cid), str(cid)), "tags": tags_of(cid)}
+                 for cid in list((DATA.get("tags") or {}).keys())[-14:]],
+        "log": list(reversed((DATA.get("log") or [])[-15:])),
+        "payments": {"total": sum(int(p.get("amount") or 0) for p in (DATA.get("payments") or [])),
+                     "count": len(DATA.get("payments") or []),
+                     "items": list(reversed((DATA.get("payments") or [])[-8:]))},
     }
 
 
@@ -2009,6 +2256,27 @@ function render(d){
       <td>${esc(a.role)}</td><td class="mut">прав: ${a.perms}</td></tr>`).join('')}
   </table><div class="mut" style="margin-top:8px">Менять роли: в боте → /admins</div></div>
 
+  <h2>Клиенты и теги <span>${d.tags.length}</span></h2>
+  <div class="card"><table>
+    ${(d.tags.length?d.tags:[]).map(t=>`<tr>
+      <td><b>${esc(t.name)}</b><div class="mut">${esc(t.id)}</div></td>
+      <td>${t.tags.length?t.tags.map(x=>'<span class="tag ok">'+esc(x)+'</span>').join(' '):'<span class="mut">нет</span>'}</td>
+      <td style="min-width:150px"><input class="reply" id="tg_${esc(t.id)}" placeholder="новый тег" style="height:30px">
+        <button class="mini" style="margin-top:6px" onclick="act({a:'tag',chat:'${esc(t.id)}',value:document.getElementById('tg_${esc(t.id)}').value});document.getElementById('tg_${esc(t.id)}').value=''">Добавить</button></td>
+    </tr>`).join('') || '<tr><td colspan="3" class="mut">тегов нет</td></tr>'}
+  </table></div>
+
+  <h2>Оплаты <span>${d.payments.count}</span></h2>
+  <div class="card">
+    <div style="font-size:20px;font-weight:700;margin-bottom:8px">${d.payments.total} Stars</div>
+    <div class="mut">${(d.payments.items.length?d.payments.items:[]).map(p=>new Date((p.ts||0)*1000).toLocaleString('ru-RU')+' · '+p.amount+' · '+esc(p.chat_id)).join('<br>')||'оплат пока нет'}</div>
+  </div>
+
+  <h2>Журнал <span>${d.log.length}</span></h2>
+  <div class="card">
+    <div class="mut">${(d.log.length?d.log:[]).map(e=>new Date((e.ts||0)*1000).toLocaleString('ru-RU')+' · <b>'+esc(e.a)+'</b> · '+esc(e.by)+' · '+esc(e.x)).join('<br>')||'журнал пуст'}</div>
+  </div>
+
   <h2>Сегменты и промокоды</h2>
   <div class="card">
     <div class="mut">${Object.keys(d.segments).length?Object.entries(d.segments).map(([k,v])=>esc(k)+': '+v).join(' · '):'нет данных'}</div>
@@ -2073,13 +2341,27 @@ def panel_action():
         notify_change("панель", "Ответ клиенту", "Кому: %s\n%s" % (chat, text[:200]))
         return jsonify(ok=True)
     if a == "status":
-        t = set_ticket_status(body.get("id"), body.get("value"))
+        t = set_ticket_status(body.get("id"), body.get("value"), "панель")
         if t:
             send(t["chat_id"], "<b>Статус заявки #%s:</b> %s" % (t["id"], t["status"]),
                  keyboard=[[{"text": "Написать в боте", "callback_data": "ask"}]])
             notify_change("панель", "Статус заявки", "#%s → %s" % (t["id"], t["status"]))
             return jsonify(ok=True)
         return jsonify(ok=False, error="нет заявки")
+    if a == "tag":
+        chat = str(body.get("chat", ""))
+        val = (body.get("value") or "").strip()
+        if not chat or not val:
+            return jsonify(ok=False, error="пусто")
+        ok = add_tag(chat, val)
+        log_action("панель", "Тег добавлен", "%s → %s" % (chat, val))
+        return jsonify(ok=bool(ok))
+    if a == "untag":
+        chat = str(body.get("chat", ""))
+        val = (body.get("value") or "").strip()
+        ok = del_tag(chat, val)
+        log_action("панель", "Тег снят", "%s → %s" % (chat, val))
+        return jsonify(ok=bool(ok))
     if a == "review":
         for r in DATA.get("reviews", []):
             if str(r.get("id")) == str(body.get("id")):
@@ -2144,13 +2426,102 @@ def send_document(chat_id, path, caption=""):
         with open(path, "rb") as f:
             return requests.post(
                 BASE + "/sendDocument",
-                data={"chat_id": chat_id, "caption": caption},
+                data={"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"},
                 files={"document": (os.path.basename(path), f)},
                 timeout=120,
             ).json()
     except Exception as e:
         print("doc error:", e)
         return {}
+
+
+def _pdf_wrap(d, text, font, maxw):
+    out = []
+    for raw in str(text).split("\n"):
+        cur = ""
+        for w in raw.split():
+            test = (cur + " " + w).strip()
+            if not cur or d.textlength(test, font=font) <= maxw:
+                cur = test
+            else:
+                out.append(cur)
+                cur = w
+        out.append(cur)
+    return out
+
+
+def make_ticket_pdf(t, path):
+    """Аккуратный PDF-бриф по заявке: A4, тёмный акцент, без лишних библиотек."""
+    from PIL import Image, ImageDraw, ImageFont
+    W, H = 1240, 1754
+    BG = (250, 251, 253)
+    INK = (17, 22, 29)
+    DIM = (108, 118, 134)
+    MINT = (140, 205, 40)
+    LINE = (226, 231, 238)
+    img = Image.new("RGB", (W, H), BG)
+    d = ImageDraw.Draw(img)
+    FONT_PATH = _asset("Onest.ttf") or "/tmp/Onest.ttf"
+    f_title = ImageFont.truetype(FONT_PATH, 64)
+    f_h = ImageFont.truetype(FONT_PATH, 30)
+    f_body = ImageFont.truetype(FONT_PATH, 26)
+    f_small = ImageFont.truetype(FONT_PATH, 21)
+    try:
+        for f in (f_title, f_h, f_body, f_small):
+            f.set_variation_by_axes([500])
+    except Exception:
+        pass
+    d.rectangle([0, 0, W, 14], fill=MINT)
+    d.text((72, 84), "ЗАЯВКА #%s" % t.get("id", "-"), font=f_small, fill=MINT)
+    d.text((72, 118), "Бриф на работу", font=f_title, fill=INK)
+    d.line([(72, 232), (W - 72, 232)], fill=LINE, width=2)
+
+    rows = [
+        ("Клиент", "%s (@%s)" % (t.get("name") or "-", t.get("username") or "-")),
+        ("Telegram", str(t.get("chat_id") or "-")),
+        ("Дата", time.strftime("%d.%m.%Y %H:%M", time.localtime(int(t.get("ts") or 0)))),
+        ("Тип", str(t.get("kind") or "-")),
+        ("Услуга", str(t.get("service") or "-")),
+        ("Статус", str(t.get("status") or "-")),
+    ]
+    y = 268
+    for k, v in rows:
+        d.text((72, y), k, font=f_small, fill=DIM)
+        d.text((330, y - 2), v, font=f_body, fill=INK)
+        y += 52
+
+    y += 20
+    d.text((72, y), "Задача", font=f_h, fill=INK)
+    y += 56
+    body = _pdf_wrap(d, t.get("text") or "-", f_body, W - 144)
+    for ln in body[:40]:
+        d.text((72, y), ln, font=f_body, fill=INK)
+        y += 42
+        if y > H - 190:
+            break
+
+    d.line([(72, H - 132), (W - 72, H - 132)], fill=LINE, width=2)
+    d.text((72, H - 108), "Сайты и телеграм-боты · @%s" % owner_username(), font=f_small, fill=DIM)
+    d.text((72, H - 76), "Цена и срок известны заранее. Демо показываю до оплаты.", font=f_small, fill=DIM)
+    d.rectangle([W - 150, H - 120, W - 72, H - 112], fill=MINT)
+    img.save(path, "PDF", resolution=150.0)
+    return path
+
+
+def payments_summary(limit=20):
+    pay = DATA.get("payments") or []
+    total = sum(int(p.get("amount") or 0) for p in pay)
+    lines = ["<b>Оплаты</b>", "", "Всего: <b>%s</b> · платежей: %s" % (total, len(pay)), ""]
+    if not pay:
+        lines.append("Пока нет оплат. Оплата звёздами — кнопка «Оплатить» в услуге.")
+        return "\n".join(lines)
+    for p in reversed(pay[-limit:]):
+        cid = str(p.get("chat_id") or "")
+        name = USERS.get(cid, cid)
+        lines.append("%s · <b>%s</b> · %s" % (
+            time.strftime("%d.%m %H:%M", time.localtime(int(p.get("ts") or 0))),
+            p.get("amount", 0), name))
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------- админы ----
@@ -2318,6 +2689,117 @@ def extra_admin(text, chat_id, user):
         v = staff_map().get(str(chat_id)) or {}
         send(chat_id, "<b>Ваши права</b>\n\nРоль: <b>%s</b>\nПрава: %s" % (
             role_title(v.get("role")), ", ".join(PERM_TITLES[x] for x in sorted(p)) or "нет"))
+        return True
+
+    if t.startswith("/brief"):
+        if not can(chat_id, "tickets"):
+            send(chat_id, denied_text()); return True
+        arg = t.split(None, 1)[1].strip() if " " in t else ""
+        tick = find_ticket(arg) if arg else ((DATA.get("tickets") or [None])[-1])
+        if not tick:
+            send(chat_id, "Заявок нет." if not arg else "Заявка %s не найдена." % arg)
+            return True
+        path = os.path.join("/tmp", "brief_%s.pdf" % tick.get("id"))
+        try:
+            make_ticket_pdf(tick, path)
+        except Exception as e:
+            print("pdf error:", e)
+            path = os.path.join(HERE, "brief_%s.pdf" % tick.get("id"))
+            try:
+                make_ticket_pdf(tick, path)
+            except Exception as e2:
+                send(chat_id, "Не смог собрать PDF: <code>%s</code>" % str(e2)[:200])
+                return True
+        send_document(chat_id, path, "<b>Бриф по заявке #%s</b>" % tick.get("id"))
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+        return True
+
+    if t == "/payments":
+        if not can(chat_id, "pay"):
+            send(chat_id, denied_text()); return True
+        send(chat_id, payments_summary())
+        return True
+
+    if t == "/tags" or t.startswith("/tags "):
+        if not can(chat_id, "users"):
+            send(chat_id, denied_text()); return True
+        arg = t.split(None, 1)[1].strip() if " " in t else ""
+        if arg:
+            cid = arg.split()[0]
+            ts = tags_of(cid)
+            send(chat_id, "<b>Теги клиента</b> <code>%s</code>\n\n%s" % (
+                cid, ", ".join(ts) if ts else "тегов нет"))
+            return True
+        counts = all_tags()
+        lines = ["<b>Теги клиентов</b>", ""]
+        if counts:
+            for k, v in sorted(counts.items(), key=lambda x: -x[1]):
+                lines.append("• <b>%s</b> — %s" % (k, v))
+        else:
+            lines.append("Тегов пока нет.")
+        lines += ["", "Фильтр в рассылке: <code>/rassylka tag:клиент</code>",
+                  "Добавить: <code>/tag ID тег</code>"]
+        send(chat_id, "\n".join(lines))
+        return True
+
+    if t.startswith("/tag "):
+        if not can(chat_id, "users"):
+            send(chat_id, denied_text()); return True
+        p = t.split()
+        if len(p) < 3:
+            send(chat_id, "Формат: <code>/tag CHAT_ID тег</code>")
+            return True
+        cid, tag = p[1], " ".join(p[2:])
+        if add_tag(cid, tag):
+            log_action(who, "Тег добавлен", "%s → %s" % (cid, tag))
+            send(chat_id, "Тег <b>%s</b> добавлен клиенту <code>%s</code>." % (tag, cid))
+        else:
+            send(chat_id, "Такой тег уже есть.")
+        return True
+
+    if t.startswith("/untag "):
+        if not can(chat_id, "users"):
+            send(chat_id, denied_text()); return True
+        p = t.split()
+        if len(p) < 3:
+            send(chat_id, "Формат: <code>/untag CHAT_ID тег</code>")
+            return True
+        cid, tag = p[1], " ".join(p[2:])
+        if del_tag(cid, tag):
+            log_action(who, "Тег снят", "%s → %s" % (cid, tag))
+            send(chat_id, "Тег <b>%s</b> снят." % tag)
+        else:
+            send(chat_id, "Такого тега нет.")
+        return True
+
+    if t == "/log" or t.startswith("/log "):
+        if not can(chat_id, "stats"):
+            send(chat_id, denied_text()); return True
+        n = t.split(None, 1)[1].strip() if " " in t else "15"
+        try:
+            n = max(3, min(40, int(n)))
+        except Exception:
+            n = 15
+        send(chat_id, log_text(n))
+        return True
+
+    if t.startswith("/logchat "):
+        if not can(chat_id, "stats"):
+            send(chat_id, denied_text()); return True
+        cid = t.split(None, 1)[1].strip()
+        ev = [e for e in (DATA.get("log") or []) if str(e.get("x") or "").find(cid) >= 0][-15:]
+        if not ev:
+            send(chat_id, "По клиенту <code>%s</code> записей нет." % cid)
+            return True
+        lines = ["<b>История клиента</b> <code>%s</code>" % cid, ""]
+        for e in reversed(ev):
+            lines.append("%s · <b>%s</b> · %s" % (
+                time.strftime("%d.%m %H:%M", time.localtime(int(e.get("ts") or 0))),
+                e.get("a", "-"), (e.get("x") or "")[:120]))
+        send(chat_id, "\n".join(lines))
         return True
 
     if t == "/admins":
@@ -2871,14 +3353,16 @@ CMD_PERMS = {
     "rassylka": "broadcast", "notifyadmins": "broadcast", "broadcast_preview": "broadcast",
     "export": "export", "exportdata": "export", "backup": "export", "csv": "export",
     "ban": "ban", "unban": "ban", "bans": "ban", "antispam_set": "ban",
-    "pay": "pay",
+    "pay": "pay", "payments": "pay",
     "tickets": "tickets", "ticket": "tickets", "open_tickets": "tickets", "done_tickets": "tickets",
     "findticket": "tickets", "ticketmsg": "tickets", "setstatus": "tickets", "who": "tickets",
-    "say": "tickets",
+    "say": "tickets", "brief": "tickets", "briefs": "tickets",
     "note": "notes", "notes": "notes", "delnote": "notes", "clearstate": "notes",
     "reviews": "reviews", "reviews_pending": "reviews",
     "users": "users", "lastusers": "users", "segments": "users", "refstats": "users",
+    "tags": "users", "tag": "users", "untag": "users", "clients": "users",
     "stats": "stats", "stats7": "stats", "week": "stats", "healthcheck": "stats", "db": "stats",
+    "log": "stats", "logchat": "stats",
     "ping": "stats", "version": "stats", "chatinfo": "stats", "reminders": "stats",
     "panel": "panel", "panelcode": "panel", "panel_code": "panel", "guides": "panel", "guide": "panel",
     "guides_all": "panel",
@@ -2892,6 +3376,18 @@ def denied_cmd(chat_id, text):
         return False
     return not can(chat_id, need)
 
+
+# ---------------------------------------------- режим календаря (calendar_mode) --
+try:
+    import calendar_mode
+    calendar_mode.start({
+        "send": send, "api": api, "kv_get": kv_get, "kv_set": kv_set,
+        "can": can, "is_admin": is_admin, "log": log_action,
+        "staff_ids": staff_ids, "perms": perms_of,
+    })
+except Exception as _ce:
+    calendar_mode = None
+    print("calendar_mode load error:", _ce)
 
 if os.environ.get("REMINDERS", "1") == "1":
     try:
