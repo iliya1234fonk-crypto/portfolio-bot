@@ -844,39 +844,59 @@ def show_price_settings(chat_id):
 
 
 ADMIN_HELP = (
-"<b>Команды админов</b>\n\n"
+"<b>Команды админов (все)</b>\n\n"
 "<b>Основное</b>\n"
-"/admin — админ-панель в боте (меню)\n"
-"/settings — настройки (цены, контакт, слот, статистика, панель)\n"
-"/panel — ссылка на мини-сайт реального времени\n"
-"/help_admin — этот список\n\n"
-"<b>Заявки и клиенты</b>\n"
-"/tickets — последние заявки\n"
-"/ticket ID — карточка заявки\n"
-"/setstatus ID статус — статус заявки (новый/принят/в работе/готово)\n"
-"/note ID текст — заметка по клиенту (chat_id или ID заявки)\n"
-"/notes ID — показать заметку\n"
-"/who CHAT_ID — данные пользователя/сегмент/заметка\n"
-"/say CHAT_ID текст — написать пользователю от имени бота\n\n"
+"/admin /settings — админ-меню\n"
+"/panel — мини-сайт реального времени\n"
+"/help_admin — все команды\n"
+"/ping — проверка, время, хранилище\n"
+"/healthcheck — быстрая диагностика\n"
+"/db — статус БД/хранилища\n"
+"/id — ваш chat_id\n\n"
+"<b>Заявки</b>\n"
+"/tickets — последние 15\n"
+"/ticket ID — карточка + Ответить/статусы\n"
+"/open_tickets — новые/принятые/в работе\n"
+"/done_tickets — готовые\n"
+"/findticket текст — поиск по заявкам\n"
+"/setstatus ID статус — сменить статус (+уведомление клиенту)\n"
+"/ticketmsg ID — текст заявки коротко\n\n"
+"<b>Клиенты/заметки</b>\n"
+"/who CHAT_ID — профиль, сегмент, заметка, заявки\n"
+"/note ID текст — заметка (по заявке или chat_id)\n"
+"/notes ID — заметка\n"
+"/delnote ID — удалить заметку\n"
+"/say CHAT_ID текст — написать клиенту\n"
+"/clearstate CHAT_ID — сбросить состояние диалога\n\n"
 "<b>Отзывы</b>\n"
-"/reviews — последние отзывы\n"
-"/reviews_pending — отзывы на модерации\n\n"
-"<b>Рассылки и аудитория</b>\n"
-"/users — количество и последние пользователи\n"
-"/segments — сегменты аудитории\n"
-"/rassylka [сегмент] — рассылка всем или по сегменту (bots/sites/catalog/brief)\n\n"
-"<b>Статистика и данные</b>\n"
+"/reviews — последние\n"
+"/reviews_pending — на модерации (с кнопками)\n\n"
+"<b>Аудитория/рассылки</b>\n"
+"/users — всего и последние\n"
+"/lastusers N — последние N\n"
+"/segments — сегменты\n"
+"/rassylka [сегмент] — всем/по сегменту\n"
+"/broadcast_preview — превью текста рассылки\n\n"
+"<b>Статистика/экспорт</b>\n"
 "/stats — статистика\n"
-"/export — экспорт настроек (JSON)\n"
-"/exportdata — экспорт заявок/отзывов (сводка)\n\n"
-"<b>Быстрые настройки</b>\n"
-"/setslot текст — статус слотов (принимаю/занят)\n"
-"/setowner username — контакт без @\n"
-"/faq — показать текущий FAQ/статус\n\n"
+"/export — настройки JSON\n"
+"/exportdata — сводка данных\n"
+"/backup — экспорт настроек + сводка\n\n"
+"<b>Настройки/контент</b>\n"
+"/prices — все цены\n"
+"/setslot текст — статус слотов\n"
+"/setowner username — контакт\n"
+"/setfaq текст — заменить FAQ\n"
+"/setabout текст — заменить описание\n"
+"/service ID — данные услуги\n"
+"/setprice_svc ID цена — цена услуги\n"
+"/maintenance on|off — слот быстро\n"
+"/faq — показать статус+FAQ\n\n"
 "<b>Служебное</b>\n"
-"/links — ссылки на услуги\n"
-"/id — ваш chat_id\n"
-"/ping — проверка бота\n"
+"/links — deep-links услуг\n"
+"/notifyadmins текст — уведомление всем админам\n"
+"/version — версия/коммит\n"
+"/chatinfo — инфо о чате\n"
 )
 
 # ---------- обработка ----------
@@ -944,8 +964,7 @@ def handle_message(msg):
             old = (SETTINGS.get("services", {}).get(sid) or {}).get("price") or (DEFAULT_SETTINGS["services"].get(sid) or {}).get("price") or "-"
             SETTINGS.setdefault("services", {}).setdefault(sid, {})["price"] = text
             save_settings(SETTINGS)
-            global SERVICES
-            SERVICES = get_services()
+            globals()["SERVICES"] = get_services()
             state.pop(chat_id, None)
             who = user.get("username") or user.get("first_name") or str(chat_id)
             sv = svc(sid)
@@ -1087,6 +1106,79 @@ def handle_message(msg):
         return send(chat_id, "Контакт: @%s" % owner_username())
     if text == "/faq" and is_admin(chat_id):
         return send(chat_id, "<b>Статус:</b> %s\n\n<b>FAQ</b>\n%s" % (SETTINGS.get("slot"), SETTINGS.get("faq")))
+
+    if text == "/healthcheck" and is_admin(chat_id):
+        return send(chat_id, "ok\nвремя: %s\nхранение: %s\nпользователей: %s\nзаявок: %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), "PostgreSQL" if _DB else "файлы", len(USERS), len(DATA.get("tickets",[]))))
+    if text == "/db" and is_admin(chat_id):
+        return send(chat_id, "Хранение: %s\nDATABASE_URL задан: %s" % ("PostgreSQL" if _DB else "файлы (JSON)", "да" if os.environ.get("DATABASE_URL") else "нет"))
+    if text == "/open_tickets" and is_admin(chat_id):
+        ts=[t for t in reversed(DATA.get("tickets",[])) if t.get("status") in ("новый","принят","в работе")][:15]
+        if not ts: return send(chat_id, "Открытых заявок нет.")
+        return send(chat_id, "<b>Открытые заявки</b>\n\n" + "\n".join("#%s [%s] %s: %s"%(t["id"],t.get("status"),t.get("name"),(t.get("text") or "")[:70]) for t in ts))
+    if text == "/done_tickets" and is_admin(chat_id):
+        ts=[t for t in reversed(DATA.get("tickets",[])) if t.get("status")=="готово"][:15]
+        if not ts: return send(chat_id, "Готовых заявок нет.")
+        return send(chat_id, "<b>Готовые</b>\n\n" + "\n".join("#%s %s: %s"%(t["id"],t.get("name"),(t.get("text") or "")[:70]) for t in ts))
+    if text.startswith("/findticket ") and is_admin(chat_id):
+        q=text.split(None,1)[1].lower()
+        ts=[t for t in DATA.get("tickets",[]) if q in json.dumps(t,ensure_ascii=False).lower()][-12:]
+        if not ts: return send(chat_id, "Ничего не найдено.")
+        return send(chat_id, "<b>Найдено</b>\n\n" + "\n".join("#%s [%s] %s: %s"%(t["id"],t.get("status"),t.get("name"),(t.get("text") or "")[:80]) for t in ts))
+    if text.startswith("/ticketmsg ") and is_admin(chat_id):
+        t=find_ticket(text.split(None,1)[1].strip())
+        return send(chat_id, (t.get("text") if t else "Не найдено.")[:3900])
+    if text.startswith("/delnote ") and is_admin(chat_id):
+        key=text.split(None,1)[1].strip(); t=find_ticket(key)
+        if t: key=str(t.get("chat_id"))
+        (DATA.get("notes") or {}).pop(str(key), None); save_data(DATA)
+        return send(chat_id, "Заметка удалена: %s" % key)
+    if text.startswith("/clearstate ") and is_admin(chat_id):
+        key=text.split(None,1)[1].strip(); state.pop(key, None); state.pop(int(key) if key.isdigit() else key, None)
+        return send(chat_id, "Состояние сброшено: %s" % key)
+    if text.startswith("/lastusers") and is_admin(chat_id):
+        n=15
+        p=text.split()
+        if len(p)>1 and p[1].isdigit(): n=min(50,int(p[1]))
+        last=list(USERS.items())[-n:]
+        return send(chat_id, "<b>Пользователи (%s)</b>\n\n%s" % (len(USERS), "\n".join("%s — %s"%(k,v) for k,v in last)))
+    if text == "/broadcast_preview" and is_admin(chat_id):
+        return send(chat_id, BROADCAST_TEXT)
+    if text == "/prices" and is_admin(chat_id):
+        return send(chat_id, "<b>Цены</b>\n\n" + "\n".join("• %s — %s (%s)"%(x["title"],x["price"],x["term"]) for x in get_services()))
+    if text.startswith("/service ") and is_admin(chat_id):
+        sv=svc(text.split(None,1)[1].strip())
+        return send(chat_id, "<b>%s</b>\n%s\n%s · %s\n\n%s" % (sv.get("id"), sv.get("title"), sv.get("price"), sv.get("term"), sv.get("desc")))
+    if text.startswith("/setprice_svc ") and is_admin(chat_id):
+        p=text.split(None,2)
+        if len(p)<3: return send(chat_id, "Формат: /setprice_svc ID цена")
+        sid,price=p[1],p[2]; old=(SETTINGS.get("services",{}).get(sid) or {}).get("price","-")
+        SETTINGS.setdefault("services",{}).setdefault(sid,{})["price"]=price; save_settings(SETTINGS); globals()["SERVICES"]=get_services()
+        notify_change(user.get("username") or "admin","Цена изменена","%s: %s → %s"%(sid,old,price))
+        return send(chat_id, "Ок: %s = %s" % (sid, price))
+    if text.startswith("/setfaq ") and is_admin(chat_id):
+        SETTINGS["faq"]=text.split(None,1)[1]; save_settings(SETTINGS)
+        notify_change(user.get("username") or "admin","FAQ изменён", SETTINGS["faq"][:300])
+        return send(chat_id, "FAQ обновлён.")
+    if text.startswith("/setabout ") and is_admin(chat_id):
+        SETTINGS["about"]=text.split(None,1)[1]; save_settings(SETTINGS)
+        notify_change(user.get("username") or "admin","Описание изменено", SETTINGS["about"][:300])
+        return send(chat_id, "Описание обновлено.")
+    if text.startswith("/maintenance ") and is_admin(chat_id):
+        v=text.split(None,1)[1].strip().lower()
+        old=SETTINGS.get("slot"); SETTINGS["slot"]="Занят, принимаю позже" if v in ("on","1","да","yes") else "Принимаю заказы"
+        save_settings(SETTINGS); notify_change(user.get("username") or "admin","Статус изменён","%s → %s"%(old,SETTINGS["slot"]))
+        return send(chat_id, "Статус: %s" % SETTINGS["slot"])
+    if text.startswith("/notifyadmins ") and is_admin(chat_id):
+        msg=text.split(None,1)[1]; notify_admin("<b>Сообщение от админа (%s)</b>\n\n%s"%(user.get("username") or user.get("first_name"), msg))
+        return send(chat_id, "Отправлено всем админам.")
+    if text == "/backup" and is_admin(chat_id):
+        send(chat_id, "<b>settings</b>\n<pre>%s</pre>" % json.dumps(SETTINGS,ensure_ascii=False,indent=1)[:3800])
+        summ={"tickets":len(DATA.get("tickets",[])),"reviews":len(DATA.get("reviews",[])),"users":len(USERS),"segments":DATA.get("segments",{})}
+        return send(chat_id, "<b>data сводка</b>\n<pre>%s</pre>" % json.dumps(summ,ensure_ascii=False,indent=1)[:3800])
+    if text == "/version" and is_admin(chat_id):
+        return send(chat_id, "bot portfolio-bot · storage: %s · panel: /panel" % ("PostgreSQL" if _DB else "файлы"))
+    if text == "/chatinfo" and is_admin(chat_id):
+        return send(chat_id, "chat_id: <code>%s</code>\nadmin: %s\nuser: @%s" % (chat_id, is_admin(chat_id), user.get("username","-")))
 
     if text == "/links" and is_admin(chat_id):
         rows = ["<b>Ссылки для постов</b>\n", "Кидай в ВК или куда угодно — человек попадёт сразу на услугу:\n"]
