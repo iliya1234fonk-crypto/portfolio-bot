@@ -843,12 +843,16 @@ def show_price_settings(chat_id):
     send(chat_id, "<b>Цены услуг</b>\n\nНажмите на услугу, чтобы изменить цену.", keyboard=rows)
 
 
+GUIDES = [('v2_0_hero.jpg', '<b>Инструкция 1/5 — обзор</b>\nКак устроена админ-система: бот, панель, ответы, уведомления.'), ('v2_1_osnovnoe.jpg', '<b>Инструкция 2/5 — основное и заявки</b>\nС чего начать и как вести заказы.'), ('v2_2_klienty.jpg', '<b>Инструкция 3/5 — клиенты, отзывы, рассылки</b>\nЗаметки, модерация, сегменты и аудитория.'), ('v2_3_nastroyki.jpg', '<b>Инструкция 4/5 — статистика и настройки</b>\nЦифры, цены, тексты и статусы бота.'), ('v2_4_service.jpg', '<b>Инструкция 5/5 — служебное и шпаргалка</b>\nМелочи, которые экономят время.')]
+
 ADMIN_HELP = (
 "<b>Команды админов (все)</b>\n\n"
 "<b>Основное</b>\n"
 "/admin /settings — админ-меню\n"
 "/panel — мини-сайт реального времени\n"
 "/help_admin — все команды\n"
+"/guides — прислать все фото-инструкции\n"
+"/guide N — одна инструкция (1..5)\n"
 "/ping — проверка, время, хранилище\n"
 "/healthcheck — быстрая диагностика\n"
 "/db — статус БД/хранилища\n"
@@ -1180,6 +1184,16 @@ def handle_message(msg):
     if text == "/chatinfo" and is_admin(chat_id):
         return send(chat_id, "chat_id: <code>%s</code>\nadmin: %s\nuser: @%s" % (chat_id, is_admin(chat_id), user.get("username","-")))
 
+    if text in ("/guides", "/guide") and is_admin(chat_id):
+        for fn, cap in GUIDES:
+            send_photo_file(chat_id, cap, None, "guides/" + fn)
+        return send(chat_id, "Полный список команд: /help_admin")
+    if text.startswith("/guide ") and is_admin(chat_id):
+        arg = text.split(None, 1)[1].strip()
+        if arg.isdigit() and 1 <= int(arg) <= len(GUIDES):
+            fn, cap = GUIDES[int(arg) - 1]
+            return send_photo_file(chat_id, cap, None, "guides/" + fn)
+        return send(chat_id, "Формат: /guide 1..%s" % len(GUIDES))
     if text == "/links" and is_admin(chat_id):
         rows = ["<b>Ссылки для постов</b>\n", "Кидай в ВК или куда угодно — человек попадёт сразу на услугу:\n"]
         for s in get_services():
